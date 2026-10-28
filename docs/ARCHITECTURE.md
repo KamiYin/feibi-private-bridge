@@ -1,55 +1,36 @@
-# 架构与消息流程
+# 当前架构与消息流程
 
-## 目标
+微信 iLink → 本机收取与本人校验 → pending / 签名 Events → 原 dot 会话 → reply 工具 → 原微信私聊。没有额外模型调用或第三方接收方。
 
-保留既有菲比 / dot 会话的处理能力，通过本人的微信私聊输入文字。当前桥接不调用额外模型 API，不提供群聊、任意收件人发送或联系人查询。
-
-```mermaid
-flowchart LR
-  A[本人微信] --> B[微信 iLink 服务]
-  B -->|长轮询| C[本地 Node 桥接]
-  C -->|签名事件回调| D[平台订阅与既有 dot 会话]
-  D -->|读取请求和回复工具| E[Secure MCP Tunnel]
-  E -->|本机认证 MCP| C
-  C -->|原来信上下文发送| B
-  B --> A
-  F[Windows 启动器] --> C
-  F --> E
-```
-
-## 组件分工
+## 组件
 
 | 文件 | 职责 |
 | --- | --- |
-| `windows-pilot/start.ps1` | 明确启动参数、既有代理、NTFS / 当前用户 ACL、Job Object、隐藏密钥输入、可选 DPAPI、扫码窗口、控制命令和退出清理 |
-| `windows-pilot/supervisor.mjs` | 子进程最小环境、临时认证、硬截止、启动回执、健康检查、二维码轮询与状态过滤 |
-| `windows-pilot/network.mjs` | 检查固定官方目标使用同一个现有 HTTP(S) 代理 |
-| `weixin-candidate/ilink.mjs` | 扫码和登录状态机、getupdates、发送回执兼容、认证异常停止 |
-| `weixin-candidate/transport.mjs` | 既有代理上的 TLS 传输、固定目标、禁止重定向、限定请求与响应 |
-| `weixin-candidate/relay.mjs` | 绑定本人私聊、文字解析、请求存储、正文过期、同上下文回复和幂等状态 |
-| `weixin-candidate/service.mjs` | MCP 工具和事件、订阅有效期、回调验证与投递退避 |
-| `weixin-candidate/runtime.mjs` | 一次收信轮询与一次回调调度各自保持单路进行，统一硬截止 |
-| `src/security.mjs` / `synthetic-pilot/hostname-proxy-callback.mjs` | 签名、回调 URL / 来源检查和既有代理传输 |
+| windows-pilot/start.ps1 | 输入与权限、现有代理、私有目录、Job 生命周期、可见扫码、文件控制 |
+| launch-hidden.vbs / continuous.ps1 / install-logon.ps1 | 无控制台任务入口、单实例监督、当前用户登录启动和显式停止 |
+| supervisor.mjs | 子进程隔离环境、健康状态、扫码与本地控制、试验截止及正式模式 |
+| persistent-state.mjs / state-dpapi.ps1 | DPAPI 封装数据密钥、AES-GCM 状态、fsync + rename 原子提交 |
+| ilink.mjs | 登录、收取、无损 JSON ID、纯文字发送和顺序分段 |
+| relay.mjs | 当前本人绑定、请求及发送意图、引用缓存、去重、正文直达 |
+| service.mjs / runtime.mjs | 原订阅恢复、事件协调、收取与回调独立调度 |
+| poll-connection-recovery.patch | Go 实际连接池更新及可脱敏阶段诊断 |
 
-`src/store.mjs` 保留通用的内存和加密文件存储类，但当前微信运行时使用 `MemoryStore` 和 `RelayMemoryStore`。类存在不表示微信消息已启用持久化。`synthetic-pilot/service.mjs` 有部分共用协议定义，目录名不是当前流程为模拟的判断依据。
+## 正常消息
 
-## 一条来信如何往返
+通过身份校验的本人文字生成真实 request_id。短文字与引用在合计 4000 UTF-8 字节预算内直接放入 pending 或事件；text_complete=false 时按原 UUID get。读取不消费请求。回复沿来信 context_token，工具不允许覆盖收件人或上下文。
 
-1. 本人扫码后，还需在原会话明确确认本人身份，再由本地执行 `confirm` 完成绑定。
-2. 收信端核对发送方、接收方、私聊范围和文本类型，将通过的文字转换为内部请求。
-3. `weixin.message.received` 事件只携带请求引用和时间等元数据。会话经 `get_owner_request` 按需取得正文。
-4. 原会话处理文字，再调用 `reply_to_owner`，提供请求引用、回复文字和幂等键。
-5. 桥接从该请求保存的收件方与上下文发送，不接受工具调用自行改写收件方。
-6. API 确定受理后记录 accepted。网络结果不明时标记 unknown，不自动重发；手机实收另由本人确认。
+发送前持久提交 sending 意图；提交失败则不发送。崩溃恢复的 sending 变成 unknown，重复工具调用不重发。accepted 后取消尚未投递通知；平台已接受的通知不可撤销，使用稳定请求 ID 和幂等键处理晚到事件。
 
-## 运行边界
+最近 15 秒有成功鉴权 pending 查询时，新消息通知至多延迟到接收后 30 秒。持续查询不会延长这条消息的截止。没有近期查询时立即通知；读取后未回复、读取响应丢失或会话中断均在有界等待后回到事件通路。
 
-- 本机 MCP 和健康端口绑定回环地址；操作控制和 MCP 使用不同临时认证密钥。代码中的回环端口是通用默认值，不是公网部署入口。
-- 隧道密钥只给隧道子进程；微信服务子进程不继承它。子进程用户目录与临时目录指向本轮私有目录。
-- 登录令牌、文字、游标与会话内去重在内存。正文保留上限 30 分钟，并受本轮剩余时间限制；有效正文容量 100 条。
-- 当前代码上限 25,200 秒。实际停止取运行时长、明确的绝对截止及已保存密钥到期时间中的较早值。这个上限不是 7 小时稳定性验收。
-- 回复工具 schema 上限为 3,500 字符，实际发送还要求 UTF-8 编码不超过 3,500 字节；中文等多字节内容可能更早触及上限。入站正文由 relay 校验。长文、附件和多模态不能据此视为已支持。
-- 回调暂时失败按原退避继续，直到成功、不可重试拒绝、订阅失效、消息过期或运行截止；这不等于无限保存或保证送达。
-- DPAPI 是可选的当前 Windows 用户隧道密钥存储。它不保存微信登录令牌；同一用户上下文下的程序仍可能解密。
+## 恢复与存储
 
-公开官方来源域名和协议路径保留用于审查；实际 Tunnel ID、OwnerNonce、完整回调地址、代理配置、签名密钥和账号从不放入仓库。
+当前用户 DPAPI 只在启动时解封一个随机数据密钥；状态提交使用 AES-256-GCM，先写 .next、fsync，再原子改名。保存登录与绑定、relay 状态、游标、原订阅和已批准 callback origin。不要把密文视为可公开资料：同一用户权限的程序可能解密。
+
+runtime-state.enc 是恢复状态，不是完整聊天档案。完成请求的引用缓存最多 100 条 / 4 MiB；淘汰正文不删除幂等结果，也不使旧消息重新发送。出站只有实际拿到服务端 message_id 才建立 ID→正文映射。没有 ID 时不能由 context_token 或 client_id 猜造。全文存档方案暂停。
+
+正式运行不设试验截止；认证失效需要按上游要求重新登录。监督器的 5 秒崩溃恢复不覆盖密钥过期或被撤销的授权。主动 stop 先持久写停止标记，后续登录任务不会自行恢复，需明确 Resume。
+
+## 引用
+
+引用依次读取 ref_msg.svr_id 或 ref_msg.message_item.msg_id；原始数字 JSON ID 用 source-aware reviver 保存字面字符串。可选 type 不应丢掉已有 text_item；partial_text 对象识别为局部引用元数据。引用始终是上下文，不是新授权。缺少原文和匹配 ID 时明确 not_cached；只保留安全结构诊断，不猜原文、不读微信历史或附件。

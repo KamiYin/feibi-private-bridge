@@ -1,100 +1,91 @@
-# 安装与部署
+# 安装、运行与恢复
 
-## 环境与可复现范围
+## 环境与源码检查
 
-本地目标环境为 Windows x64、NTFS、Windows PowerShell 5.1 STA、Node.js 24。桥接的 JavaScript 代码使用 Node 内置模块；二维码渲染器的必要源码已随库保留，不需要运行依赖安装脚本。
+Windows x64、NTFS、PowerShell 5.1 STA、Node.js 24+。本仓库使用内置 Node 模块与已保留许可的二维码源码，不需要 npm install。选择自己可写的专用目录。公开副本不含 EXE、原平台 Tunnel、账号或已登录状态。
 
-公开副本可以运行离线回归。它没有运行时 EXE，也没有服务器端 Tunnel、订阅和账号授权，不能下载后直接连入原部署。
-
-```powershell
+~~~powershell
 npm test
 npm run preflight
-```
+~~~
 
-预检只读本地包和二进制，不启动网络或扫码。本仓库默认返回 `REVIEWED_BINARY_MISSING`。不要把预检可运行与真实微信连接混为一谈。
+默认缺少二进制应报告 REVIEWED_BINARY_MISSING、launched=false、credential_read=false。测试使用合成数据和隔离临时目录；部署与测试不要混用真实凭据。
 
-## 隧道运行时来源与构建
+## 隧道运行时构建
 
-原构建记录：OpenAI [tunnel-client](https://github.com/openai/tunnel-client)，v0.0.18，提交 `274a5588414819f063d27100a4fb1096aae3830f`；Go 1.27.3，Windows / amd64，CGO 关闭，trimpath。记录文件保留在 `windows-pilot/BUILD_PROVENANCE.json` 和 `binary-build-info.txt`。
+上游：[openai/tunnel-client](https://github.com/openai/tunnel-client)，提交 274a5588414819f063d27100a4fb1096aae3830f（v0.0.18），原构建 Go 1.27.3 / windows-amd64 / CGO=0。先在独立上游源码目录准备依赖，依次应用两个补丁：
 
-在单独的上游源码目录中，按其官方构建环境准备依赖后应用本仓库补丁：
-
-```powershell
-git clone https://github.com/openai/tunnel-client.git
-Set-Location tunnel-client
+~~~powershell
 git checkout 274a5588414819f063d27100a4fb1096aae3830f
 git apply --check 'YOUR_BRIDGE_CHECKOUT\windows-pilot\origin-guard.patch'
 git apply 'YOUR_BRIDGE_CHECKOUT\windows-pilot\origin-guard.patch'
-$env:CGO_ENABLED = '0'
-$env:GOOS = 'windows'
-$env:GOARCH = 'amd64'
-$env:GOTOOLCHAIN = 'local'
-go test ./pkg/controlplane/internal
-go build -trimpath -o tunnel-client-runtime-origin-guard.exe ./cmd/client-runtime
+git apply --check 'YOUR_BRIDGE_CHECKOUT\windows-pilot\poll-connection-recovery.patch'
+git apply 'YOUR_BRIDGE_CHECKOUT\windows-pilot\poll-connection-recovery.patch'
+$env:CGO_ENABLED='0'
+$env:GOOS='windows'
+$env:GOARCH='amd64'
+$env:GOTOOLCHAIN='local'
+go test ./pkg/controlplane/internal -run 'TestPollRecovery|TestPollPool|TestPollTrace' -count=1 -timeout=60s
+go build -trimpath -buildvcs=false -ldflags '-s -w -X github.com/openai/tunnel-client/pkg/version.semanticVersion=0.0.18-local-poll-recovery.3 -X github.com/openai/tunnel-client/pkg/version.GitSHA=274a5588414819f063d27100a4fb1096aae3830f -X github.com/openai/tunnel-client/pkg/version.Flavor=runtime' -o tunnel-client-runtime-origin-guard.exe ./cmd/client-runtime
 Get-FileHash .\tunnel-client-runtime-origin-guard.exe -Algorithm SHA256
-```
+~~~
 
-这些是从来源记录和入口文件整理的构建步骤，**本次公开整理没有重新编译 Go 运行时，也未证明重新构建可得到逐字节相同的 EXE**。原记录的离线构建还使用了 `GOPROXY=off`，前提是依赖缓存已备齐；不要把离线记录理解为首次构建不需要依赖。
+原部署固定 SHA-256：e607591deed958e2e324a9246b2683c727405bcbe69164d45cc67137db5d4e5f。公开整理没有重新编译或证明逐字节可复现。自行构建须审阅来源、补丁及依赖后，在自己的派生版本更新预期哈希与记录，不应删除验证。核验后的 EXE 放 windows-pilot/bin/tunnel-client-runtime-origin-guard.exe（已忽略提交）。BUILD_PROVENANCE.json 和 binary-build-info.txt 为脱敏来源记录，保留第三方许可。
 
-启动器固定期望的原构建 SHA-256 是：
+## 准备自己的平台与密钥
 
-```text
-30e10e36956085c6c73f88e30942d1b96c2645f1ad6cea3b7697cb2de5ce5c48
-```
+需要自己有权限的官方 Tunnel、原会话插件/Events 订阅，以及本人微信。原项目的标识和权限不随代码转让。三个官方来源仍走既有、相同的 HTTP(S) 代理；不要为示例关闭 TLS 或改系统安全配置。
 
-自行构建件与此不同会被拒绝。只有完成自己的源码、补丁、依赖和构建核验后，才应在自己的派生版本更新固定哈希、构建说明及相应测试；不要直接删除校验。通过核验的文件放到 `windows-pilot/bin/tunnel-client-runtime-origin-guard.exe`，该目录已忽略。公开仓库的预检测试按“不含二进制”的发行形式编写；本机添加二进制后，应单独运行真实预检并调整自己的发行测试。
+在正常可见的本机 PowerShell 中使用隐藏输入保存专用 tunnel key；不要放入命令参数、聊天、仓库或 .env：
 
-## 本地配置
+~~~powershell
+powershell.exe -NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\windows-pilot\start.ps1 -StoreCredential -CredentialExpiresUtc 'YOUR_ACTUAL_UTC_EXPIRY'
+~~~
 
-`.env.example` 仅说明配置入口，启动器不自动读取 `.env`。不要把密钥放入 `.env`、命令参数或仓库。
+首次导入入口仍限制 30 天内的真实 UTC 到期（含毫秒），已有文件不覆盖；读取入口支持已审核元数据 never。原部署通过官方控制台将原 key 改为 Never 后，单独同步过其本地元数据，未更换 secret。这不意味着首次导入模板会自动延长服务端权限，或公开副本有自动轮换功能。使用者须按自己的官方期限配置；需要修改导入期限时应明确改自己的部署，而非伪造日期。
 
-| 输入 | 配置方法 |
-| --- | --- |
-| Tunnel ID | 启动参数 `-TunnelId`，由自己的平台隧道配置取得 |
-| 本轮本人确认值 | `-OwnerNonce`，使用与当前会话匹配的新值 |
-| 隧道密钥 | 正常本机控制台隐藏输入；可选经明确授权的 DPAPI 存储入口 |
-| 既有代理 | 启动器读取 Windows 当前代理或已有明确代理配置，不在仓库保存 |
-| 回调订阅 | 在自己的原会话完成订阅；本地观察到候选后按现有流程 approve |
-| 运行时长 | `-Seconds`，1–25200 秒；恢复同一轮时加原本的 `-DeadlineUtc` |
+默认状态目录为当前用户 LocalAppData 下 FeibiPrivateBridge/credentials。tunnel-key.dpapi 保存专用 key，runtime-state-key.dpapi 保护恢复数据密钥，runtime-state.enc 保存登录与恢复状态。这些文件均属私密资料。同一 Windows 用户下有权限的进程可能解密；备份目录也应保持私有。打包应用环境可能虚拟化 LocalAppData，任务与首次导入必须指向同一实际位置。
 
-当前代理校验要求三个固定官方来源选中同一个 HTTP(S) 代理。DIRECT、不同代理、代理认证或不明确结果会被拒绝。不要为适配示例改系统网络、禁用 TLS 或关安全软件。
+## 首次长期运行
 
-公开副本将原本机器专属的工作目录改成**仓库根目录**：每次启动在其下创建随机私有目录，并继续检查 NTFS、祖先目录和当前用户 ACL。选用自己可写的 NTFS 路径。
+复制 windows-pilot/deployment.example.json 为 deployment.local.json，填写自己的 tunnel_id 和 owner_nonce。仅这份忽略提交的配置进入监督器，不保存 secret。
 
-## 首次启动与本人扫码
+先以本人明确批准的范围启动一次，完成扫码绑定与原订阅：
 
-先在正常本机 PowerShell 控制台完成预检。确认有自己的隧道、订阅与权限后，运行以下模板；`YOUR_...` 必须替换，模板本身不能直接运行：
+~~~powershell
+powershell.exe -NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\windows-pilot\start.ps1 -Run -Standalone -Persistent -StoredCredential -ApprovePrivateTunnel -ApproveQrLogin -ApproveOwnerTextTransfer -ApproveOwnerReply -TunnelId 'YOUR_TUNNEL_ID' -OwnerNonce 'YOUR_OWNER_NONCE'
+~~~
 
-```powershell
-powershell.exe -NoLogo -NoProfile -STA -File .\windows-pilot\start.ps1 `
-  -Run -Standalone `
-  -ApprovePrivateTunnel -ApproveQrLogin -ApproveOwnerTextTransfer -ApproveOwnerReply `
-  -TunnelId 'YOUR_TUNNEL_ID' -OwnerNonce 'YOUR_OWNER_NONCE' -Seconds 3600
-```
+此入口使用已保存 key，后台启动；QR 单独显示。launch 回执不等于后端 ready，须核对 status。原会话订阅产生候选后，只批准核实过的官方 callback origin。执行 qr，待本人确认扫码后再 confirm；不要凭“扫码显示成功”自动绑定。使用下面的原控制入口：
 
-1. 在本机受控输入提示中输入隧道密钥。不要把密钥发到聊天、日志或命令行参数。
-2. `standalone_host_launched` 只是宿主窗口已创建。看到实际 `bounded_windows_started` 才表示后端启动；核对该回执中的截止时间。
-3. 先在原会话确认事件订阅就绪，再查看本地 `status`。只对已观察并核验的官方回调来源执行 `approve`。
-4. 执行 `qr`，二维码只在本机内存窗口显示，随后自动轮询。
-5. 本人扫码后，在原会话明确确认本人扫码完成，再执行当轮 `confirm`。普通二维码过期可明确重新执行 `qr`，不能沿用旧身份确认。
-6. 本人在微信发一条普通测试文字；核对来信事件、原会话读取、回复 API 回执，最后在手机确认。
+~~~powershell
+powershell.exe -NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File .\windows-pilot\start.ps1 -ControlCommand status
+# 同一入口的 ControlCommand 可取 approve / qr / confirm / stop
+~~~
 
-不要在仍有同用户桥接运行时另起实例。这里的发布整理没有启动第二个桥接。
+用本人文字完成真实往返验证，再协调无发送在途的交接。保留原订阅，不为每次重启重新创建订阅。
 
-## 日常控制与停止
+## 交给当前用户登录任务
 
-控制台支持 `status`、`approve`、`qr`、`poll`、`confirm`、`stop`。独立窗口不可定位时，可从同一项目用以下入口：
+正常 stop 旧实例并确认清理后，注册同一任务。安装脚本使用当前用户、Interactive、Limited，不安装系统服务：
 
-```powershell
-powershell.exe -NoLogo -NoProfile -STA -File .\windows-pilot\start.ps1 -ControlCommand status
-```
+~~~powershell
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File .\windows-pilot\install-logon.ps1
+# 本次明确恢复时，移除自己状态目录中的 operator-stopped 标记后：
+Start-ScheduledTask -TaskName FeibiPrivateBridge
+Get-ScheduledTask -TaskName FeibiPrivateBridge
+~~~
 
-文件控制支持 status / approve / qr / confirm / stop，仍需满足原流程的身份确认和回调条件。运行结果文件包含本机状态和私有目录位置，只留本地，不提交。
+主动 stop 会保留停止标记，所以单纯 Start-ScheduledTask 不会偷偷重新启用。也可在明确要求恢复时，通过隐藏 PowerShell 运行 continuous.ps1 -Resume；与任务互斥保证单监督器。不要同时启动多个副本。
 
-`stop` 后核对停止与清理回执。关闭窗口不等于服务器端撤销账号授权或密钥；需要撤销时按各自官方界面处理。不要承诺进程崩溃或系统重启后免扫码恢复。
+任务入口 wscript.exe //B //NoLogo → launch-hidden.vbs → 隐藏监督器 → CreateNoWindow 桥接子进程。文件控制仍可用；QR 需要时显示独立窗口。没有托盘或开机前服务。Windows Script Host 被禁用的机器需另行部署适用入口，当前发布不修改该策略。
 
-## 可选 DPAPI
+## 验证恢复与升级
 
-经使用者明确决定，可用 `-StoreCredential -CredentialExpiresUtc 'YOUR_UTC_EXPIRY'` 在本机隐藏输入导入专用隧道密钥。到期时间须为毫秒精度 UTC，首次导入上限 30 天；已有文件不静默覆盖。后续实际运行加 `-StoredCredential`，并使用专用 PS5.1 STA File 宿主。
+升级前确认没有发送在途；正常 stop，保留同一私有状态目录，更新代码，然后明确恢复原任务。核实 authenticated、owner_bound、callbacks_enabled，以及原订阅数量和 pending。sending 恢复成 unknown，不可为“补发”绕开幂等。认证失效可能仍需扫码。
 
-此入口采用 Windows 当前用户 DPAPI 与私有 ACL；不会保存微信令牌。缺失、解密失败、过期分别返回固定错误码。仓库不含 DPAPI 文件，本次整理也未重新导入、读取或替换真实密钥。
+原部署已实测任务接管、免扫码、原订阅及跨重启 pending 恢复。完整 Windows 登录和 dot 完整重启的端到端链路尚未单独实测；订阅有效期和平台调度仍由平台控制。卸载任务可在主动 stop 后通过 Windows 计划任务管理或 Unregister-ScheduledTask 处理；不要顺手删除私密状态或撤销其他应用凭据。
+
+## 试验模式与当前边界
+
+不传 Persistent 时仍有 1–43200 秒试验上限，可传原 DeadlineUtc 保持同一轮截止。正式模式不设试验硬截止，但真正网络超时、服务端权限、QR 有效期和私聊身份仍有效。长回复以 3500 UTF-8 字节保守分段，失败后不自动重发；仍有 HTTP 请求体/响应体资源边界。全文存档、媒体与历史拉取未实现。
