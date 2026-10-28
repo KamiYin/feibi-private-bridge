@@ -1,0 +1,25 @@
+# Deployment secrets and local state
+.env
+.env.*
+!.env.example
+*.dpapi
+*.pem
+*.key
+credentials/
+secrets/
+logs/
+*.log
+*.jsonl
+*.sqlite*
+*.db
+node_modules/
+windows-pilot/bin/
+windows-pilot/standalone-result.json
+feibi-private-*/
+operator-*.json
+operator-*.tmp
+*.zip
+*.exe
+*.dmp
+playwright/
+.auth/
