@@ -23,3 +23,13 @@ operator-*.tmp
 *.dmp
 playwright/
 .auth/
+
+# Long-running local state and deployment settings
+*.enc
+*.next
+windows-pilot/deployment.local.json
+windows-pilot/host-context.json
+windows-pilot/host-file-check.txt
+windows-pilot/profile-inspection.json
+operator-stopped
+rollback-*/

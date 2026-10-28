@@ -1,8 +1,8 @@
 {
   "name": "feibi-private-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Windows 本人微信文字与既有 dot 会话的桥接源码和脱敏过程记录",
+  "description": "Owner-only WeChat text bridge to an existing dot conversation: persistent Windows operation and reference resolution",
   "engines": {
     "node": ">=24"
   },
