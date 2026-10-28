@@ -1,3 +1,4 @@
+import {PersistentState} from '../windows-pilot/persistent-state.mjs';
 import {IlinkSession,ILINK_ORIGIN} from './ilink.mjs';
 import {createIlinkProxyTransport} from './transport.mjs';
 import {OwnerTextRelay,RelayMemoryStore} from './relay.mjs';
@@ -13,7 +14,7 @@ export function inspectWeixinRuntime(env={}){
   if(env.WEIXIN_TUNNEL_ISOLATION!=='single-user')issues.push('SINGLE_USER_TUNNEL_REQUIRED');
   if(!secret(env.SYNTHETIC_MCP_SECRET)||!secret(env.SYNTHETIC_OPERATOR_SECRET)||env.SYNTHETIC_MCP_SECRET===env.SYNTHETIC_OPERATOR_SECRET)issues.push('DISTINCT_LOCAL_KEYS_REQUIRED');
   if(typeof env.WEIXIN_OWNER_NONCE!=='string'||!/^bind:[A-Za-z0-9_-]{16,80}$/.test(env.WEIXIN_OWNER_NONCE))issues.push('CURRENT_CHAT_NONCE_REQUIRED');
-  if(!Number.isSafeInteger(deadline)||deadline<=Date.now()||deadline>Date.now()+25200000)issues.push('BOUNDED_DEADLINE_REQUIRED');
+  if(!Number.isSafeInteger(deadline)||deadline<=Date.now()||(env.WEIXIN_PERSISTENT!=='yes'&&deadline>Date.now()+43200000))issues.push('BOUNDED_DEADLINE_REQUIRED');
   if(!Number.isSafeInteger(port)||port<0||port>65535)issues.push('INVALID_PORT');
   if(env.NODE_TLS_REJECT_UNAUTHORIZED==='0'||env.NODE_OPTIONS||env.DEBUG||env.NODE_DEBUG)issues.push('UNSAFE_RUNTIME_OPTIONS');
   try{existingHttpsProxy(env);}catch{issues.push('EXISTING_HTTPS_PROXY_REQUIRED');}
@@ -22,18 +23,22 @@ export function inspectWeixinRuntime(env={}){
 }
 export function createWeixinRuntime({env={},auditSink=()=>{},request,post,serverFactory=createWeixinServer}={}){
   const report=inspectWeixinRuntime(env);if(!report.canStart)throw new Error('WEIXIN_PREFLIGHT_REJECTED');
+  const durable=env.WEIXIN_PERSISTENT==='yes'?new PersistentState(env.WEIXIN_STATE_DIRECTORY):null;
   const deadline=Number(env.WEIXIN_DEADLINE_UNIX_MS),principal=Object.freeze({id:'single-private-weixin-owner'}),audit=makeAudit(auditSink);
   const session=new IlinkSession({request:request??createIlinkProxyTransport({env,approvedOrigins:[ILINK_ORIGIN],networkActionApproved:true,allowLegacyQrGet:true}),
-    qrApproved:true,qrGet405Compatibility:true,ownerConfirmationNonce:env.WEIXIN_OWNER_NONCE,deadline,approvedApiOrigins:[ILINK_ORIGIN]});
+    persistent:!!durable,restored:durable?.state.session,onSave:durable?v=>durable.set('session',v):undefined,qrApproved:true,qrGet405Compatibility:true,ownerConfirmationNonce:env.WEIXIN_OWNER_NONCE,deadline,approvedApiOrigins:[ILINK_ORIGIN]});
   let stopped=false,started=false,server,timer,deadlineTimer,busy=false,tick=Promise.resolve(),eventBusy=false,eventTick=Promise.resolve(),nextPoll=0,failures=0;
   const authorize=()=>!stopped&&Date.now()<deadline;
   const relay=new OwnerTextRelay({session,principal,authorize,readApproved:true,repliesApproved:true,eventsApproved:true,
-    store:new RelayMemoryStore(),retentionMs:Math.max(1,Math.min(1800000,deadline-Date.now())),sendTimeoutMs:15000});
-  const service=new WeixinMcpService({session,relay,principal,authorize,store:new MemoryStore(),
+    store:new RelayMemoryStore({restored:durable?.state.relay,commit:durable?v=>durable.set('relay',v):undefined}),retentionMs:durable?Number.MAX_SAFE_INTEGER:Math.max(1,Math.min(1800000,deadline-Date.now())),sendTimeoutMs:15000});
+  const eventStore=new MemoryStore(durable?.state.events);if(durable)eventStore.persist=v=>durable.set('events',v);
+  const service=new WeixinMcpService({session,relay,principal,authorize,store:eventStore,
     post:async()=>{throw new Error('CALLBACKS_DISABLED');},callbacksApproved:false,injectionApproved:false,originReviewApproved:true,
     runtimeExpiresAt:deadline,postFactory:origin=>post??createHostnameProxyCallbackPoster({proxyUrl:existingHttpsProxy(env),approvedOrigin:origin,hostnameProxyReviewApproved:true}),audit});
+  if(durable?.state.callbackOrigin)service.pendingOrigin=durable.state.callbackOrigin;
+  const originalApprove=service.approveCallbackOrigin.bind(service);service.approveCallbackOrigin=async origin=>{const result=await originalApprove(origin);if(durable)durable.set('callbackOrigin',origin);return result;};
   const stopRuntime=async()=>{
-    if(stopped)return;stopped=true;clearInterval(timer);clearTimeout(deadlineTimer);session.stop();service.stop();
+    if(stopped)return;stopped=true;clearInterval(timer);clearTimeout(deadlineTimer);session.stop({preserve:true});service.stop();
     if(server?.listening){const closed=new Promise(r=>server.close(r));const force=setTimeout(()=>server.closeAllConnections(),12000);force.unref();await closed;clearTimeout(force);}
     await Promise.allSettled([tick,eventTick]);
   };
@@ -41,10 +46,11 @@ export function createWeixinRuntime({env={},auditSink=()=>{},request,post,server
     async start(){
       if(started||stopped)throw new Error('RUNTIME_NOT_STARTABLE');started=true;
       try{
+        if(durable?.state.callbackOrigin)await service.approveCallbackOrigin(durable.state.callbackOrigin);
         server=serverFactory({pilot:service,session,principal,mcpSecret:env.SYNTHETIC_MCP_SECRET,operatorSecret:env.SYNTHETIC_OPERATOR_SECRET});
         await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(report.port,'127.0.0.1',()=>{server.removeListener('error',reject);resolve();});});
         if(stopped||Date.now()>=deadline)throw new Error('STARTUP_STOPPED');
-        deadlineTimer=setTimeout(()=>{void stopRuntime().catch(()=>audit('deadline_stop','failed'));},Math.max(1,deadline-Date.now()));deadlineTimer.unref();
+        deadlineTimer=setInterval(()=>{if(Date.now()>=deadline)void stopRuntime().catch(()=>audit('deadline_stop','failed'));},Math.min(1000,Math.max(1,deadline-Date.now())));deadlineTimer.unref();
         timer=setInterval(()=>{
           if(stopped||Date.now()>=deadline||!session.isAuthenticated())return;
           // One owner poller; callback retries have a separate in-flight guard.
@@ -61,7 +67,7 @@ export function createWeixinRuntime({env={},auditSink=()=>{},request,post,server
               .catch(()=>audit('weixin_events','failed')).finally(()=>{eventBusy=false;});
           }
         },250);timer.unref();
-        return{mode:'private_weixin_candidate',host:'127.0.0.1',port:server.address().port,memory_only:true,callbacks_enabled:false,qr_started:false};
+        return{mode:'private_weixin_candidate',host:'127.0.0.1',port:server.address().port,memory_only:!durable,callbacks_enabled:service.callbacksApproved,qr_started:false};
       }catch(e){stopped=true;session.stop();service.stop();clearInterval(timer);clearTimeout(deadlineTimer);if(server?.listening){server.closeAllConnections();await new Promise(r=>server.close(r));}throw e;}
     },
     stop:stopRuntime,

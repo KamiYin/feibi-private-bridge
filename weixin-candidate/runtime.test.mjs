@@ -64,11 +64,11 @@ test('operator validation failures retain fixed safe categories, never arbitrary
  assert.equal(attempts,0);
 });
 
-test('seven-hour runtime boundary accepts 25200000 ms and rejects a longer or expired run',async t=>{
- const now=Date.parse('2030-01-01T00:00:00Z');t.mock.method(Date,'now',()=>now);
- const approved=env({WEIXIN_DEADLINE_UNIX_MS:String(now+25200000)});
+test('twelve-hour runtime boundary accepts 43200000 ms and rejects a longer or expired run',async t=>{
+ const now=Date.parse('2026-10-28T00:00:00Z');t.mock.method(Date,'now',()=>now);
+ const approved=env({WEIXIN_DEADLINE_UNIX_MS:String(now+43200000)});
  assert.equal(inspectWeixinRuntime(approved).canStart,true);
- for(const deadline of [now,now+25200001])assert.ok(inspectWeixinRuntime(env({WEIXIN_DEADLINE_UNIX_MS:String(deadline)})).issues.includes('BOUNDED_DEADLINE_REQUIRED'));
+ for(const deadline of [now,now+43200001])assert.ok(inspectWeixinRuntime(env({WEIXIN_DEADLINE_UNIX_MS:String(deadline)})).issues.includes('BOUNDED_DEADLINE_REQUIRED'));
  let options,calls=0;const server=new FakeServer(),runtime=createWeixinRuntime({env:approved,request:async()=>{calls++;throw new Error('must not call');},serverFactory:o=>{options=o;return server;}});
  await runtime.start();assert.equal(options.session.status().phase,'idle');assert.equal(calls,0);
  await runtime.stop();assert.equal(server.closed,true);

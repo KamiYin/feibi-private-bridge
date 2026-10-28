@@ -245,7 +245,7 @@ test('receive diagnostics distinguish empty, accepted, filtered and duplicate ba
  await ingest(s,[msg('5',{to_user_id:'another-private-bot'})]);assert.equal(s.relay.pollStatus().phase,'filtered');
  await ingest(s,[msg('1')]);assert.equal(s.relay.pollStatus().phase,'duplicates');
  const status=await s.relay.status(s.principal);assert.equal(status.poll_diagnostic.polls,4);assert.equal(status.poll_diagnostic.successful_polls,4);
- for(const secret of [OWNER,BOT,BODY,CONTEXT,'synthetic-cursor','other-private-owner','another-private-bot'])assert.ok(!JSON.stringify(status).includes(secret));
+ for(const secret of [OWNER,BOT,CONTEXT,'synthetic-cursor','other-private-owner','another-private-bot'])assert.ok(!JSON.stringify(status).includes(secret));
 });
 test('receive diagnostics retain HTTP failure class despite poll_failed and redact unknown errors',async()=>{
  const s=setup();s.session.getUpdates=async()=>{throw Object.assign(new Error('private raw failure'),{code:'ILINK_HTTP_REJECTED',httpStatus:503});};
@@ -276,4 +276,110 @@ test('optional state and timestamp do not reject owner text and expired bodies r
  assert.equal((await s.relay.pollOnce(s.principal)).accepted,1);
  const status=await s.relay.status(s.principal);assert.equal(status.expired,100);assert.equal(status.pending,1);assert.equal(status.capacity,100);
  assert.equal(Object.values(s.store.snapshot().requests).filter(r=>r.text!==undefined).length,1);
+});
+
+test('pending inbox returns bounded owner text without consuming requests or events', async () => {
+  const s=setup();await ingest(s,[msg('pending-first'),msg('other',{from_user_id:'another-owner'})]);s.advance(10);
+  await ingest(s,[msg('pending-second')],'next');
+  const before=s.store.snapshot(), requests=Object.values(before.requests), calls=s.calls.length;
+  const listed=await s.relay.tool(s.principal,'list_pending_owner_requests',{});
+  assert.deepEqual(listed,{requests:requests.map(r=>({request_id:r.requestId,received_at:r.receivedAt,reply_status:'not_sent',text:BODY,text_complete:true}))});
+  assert.deepEqual(await s.relay.tool(s.principal,'list_pending_owner_requests',{}),listed);
+  assert.deepEqual(s.store.snapshot(),before);assert.equal(s.calls.length,calls);
+  for(const value of [OWNER,BOT,CONTEXT,'pending-first','pending-second','next'])assert.ok(!JSON.stringify(listed).includes(value));
+});
+
+test('pending inbox omits accepted sending unknown and expired requests without deleting data', async () => {
+  const s=setup();await ingest(s,[msg('one'),msg('two'),msg('three')]);
+  const ids=Object.keys(s.store.snapshot().requests);await s.relay.reply(s.principal,reply(ids[0]));
+  let release,started;const sent=new Promise(resolve=>{started=resolve;});
+  s.session.sendText=()=>{started();return new Promise(resolve=>{release=resolve;});};
+  const pendingReply=s.relay.reply(s.principal,reply(ids[1],{idempotency_key:'synthetic_intent_2'}));await sent;
+  const expected={requests:[{request_id:ids[2],received_at:100000,reply_status:'not_sent',text:BODY,text_complete:true}]};
+  assert.deepEqual(await s.relay.tool(s.principal,'list_pending_owner_requests',{}),expected);
+  release(null);assert.equal((await pendingReply).status,'unknown');
+  assert.deepEqual(await s.relay.tool(s.principal,'list_pending_owner_requests',{}),expected);
+  s.advance(3600000);const before=s.store.snapshot();
+  assert.deepEqual(await s.relay.tool(s.principal,'list_pending_owner_requests',{}),{requests:[]});
+  assert.deepEqual(s.store.snapshot(),before);
+});
+
+test('pending inbox preserves principal authentication binding and no-argument scope', async () => {
+  const s=setup();await ingest(s);
+  await assert.rejects(s.relay.tool({...s.principal},'list_pending_owner_requests',{}),code('not_authorized'));
+  await assert.rejects(s.relay.tool(s.principal,'list_pending_owner_requests',{recipient:'another-owner'}),code('invalid_arguments'));
+  s.relay.readApproved=false;await assert.rejects(s.relay.listPending(s.principal),code('not_authorized'));s.relay.readApproved=true;
+  s.authenticated(false);await assert.rejects(s.relay.listPending(s.principal),code('not_authenticated'));s.authenticated(true);
+  s.binding({ownerUserId:OWNER,botId:BOT,apiOrigin:ORIGIN,confirmedAt:100001});
+  await assert.rejects(s.relay.listPending(s.principal),code('binding_changed'));
+  const fresh=setup();assert.deepEqual(await fresh.relay.listPending(fresh.principal),{requests:[]});
+});
+
+test('inline pending uses one UTF8 budget, preserves UUID fallback and does not consume',async()=>{
+ const s=setup();const a='a'.repeat(3000),b='文'.repeat(1000);
+ await ingest(s,[msg('a',{item_list:[{type:1,text_item:{text:a}}]}),msg('b',{item_list:[{type:1,text_item:{text:b}}]})]);
+ const before=s.store.snapshot();const list=await s.relay.listPending(s.principal,{});
+ assert.equal(list.requests[0].text,a);assert.equal(list.requests[0].text_complete,true);
+ assert.equal(list.requests[1].text,'');assert.equal(list.requests[1].text_complete,false);
+ assert.equal((await s.relay.get(s.principal,{request_id:list.requests[1].request_id})).text,b);
+ assert.deepEqual(s.store.snapshot(),before);
+});
+test('durable intent commit failure prevents any provider send',async()=>{
+ const store=new RelayMemoryStore({commit:state=>{if(Object.values(state.intents).some(i=>i.status==='sending'))throw new Error('synthetic_disk_failure');}});
+ const s=setup({store});const requestId=await ingest(s);await assert.rejects(s.relay.reply(s.principal,reply(requestId)),/synthetic_disk_failure/);assert.equal(s.calls.filter(c=>c.send).length,0);assert.equal(Object.keys(store.snapshot().intents).length,0);
+});
+test('crash after durable reservation restores unknown and never replays send',async()=>{
+ let reserved;const store=new RelayMemoryStore({commit:state=>{if(Object.values(state.intents).some(i=>i.status==='sending'))reserved=structuredClone(state);}});
+ const s=setup({store});const requestId=await ingest(s);await s.relay.reply(s.principal,reply(requestId));assert.ok(reserved);
+ const restored=setup({store:new RelayMemoryStore({restored:reserved})});const outcome=await restored.relay.reply(restored.principal,reply(requestId));assert.equal(outcome.status,'unknown');assert.equal(outcome.duplicate,true);assert.equal(restored.calls.filter(c=>c.send).length,0);
+});
+
+test('persistent accepted reply retains context while retaining duplicate outcome',async()=>{
+ const s=setup({retentionMs:Number.MAX_SAFE_INTEGER});const id=await ingest(s);const args=reply(id);assert.equal((await s.relay.reply(s.principal,args)).status,'accepted');const state=s.store.snapshot();assert.equal(state.requests[id].text,BODY);assert.equal(state.requests[id].sentText,args.text);assert.equal(state.requests[id].status,'answered');assert.equal(state.requests[id].contextToken,undefined);assert.equal((await s.relay.reply(s.principal,args)).duplicate,true);
+});
+test('production context survives reply and restart; references use item aliases and optional text type',async()=>{
+ const s=setup({retentionMs:Number.MAX_SAFE_INTEGER});
+ const first=await ingest(s,[msg('9007199254740993',{item_list:[{type:1,msg_id:'opaque:001',text_item:{text:BODY}}]})]);
+ await s.relay.reply(s.principal,reply(first));
+ const restored=setup({retentionMs:Number.MAX_SAFE_INTEGER,store:new RelayMemoryStore({restored:s.store.snapshot()})});restored.advance(1);
+ await ingest(restored,[msg('9007199254740994',{item_list:[{type:1,text_item:{text:'new'},ref_msg:{svr_id:'opaque:001',partial_text:{startindex:0,endindex:2}}}]})]);
+ const pending=(await restored.relay.listPending(restored.principal)).requests[0];
+ assert.equal(pending.quoted[0].text,BODY);assert.equal(pending.quoted[0].partial,true);
+ const read=await restored.relay.get(restored.principal,{request_id:pending.request_id});assert.equal(read.context,undefined);assert.equal(restored.store.snapshot().requests[first].text,BODY);
+ const direct=restored.relay.admit(msg('3',{item_list:[{type:1,text_item:{text:'new'},ref_msg:{message_item:{text_item:{text:'quoted without optional type'}}}}]}),restored.session.bindingForRelay());assert.equal(direct.quoted[0].text,'quoted without optional type');
+ const missing=restored.relay.admit(msg('4',{item_list:[{type:1,text_item:{text:'new'},ref_msg:{message_item:{type:2}}}]}),restored.session.bindingForRelay());assert.equal(missing.quoted[0].unavailable_reason,'source_id_absent');assert.equal(missing.quoted[0].text,undefined);
+});
+test('outbound text is cached only with exact server ID; no conversation history interface',async()=>{
+ for(const hasId of [false,true]){
+  const s=setup({retentionMs:Number.MAX_SAFE_INTEGER});s.session.sendText=async()=>({accepted:true,...(hasId?{messageId:'9007199254740993123'}:{})});
+  const first=await ingest(s);await s.relay.reply(s.principal,reply(first));s.advance(1);
+  await ingest(s,[msg('2',{item_list:[{type:1,text_item:{text:'new'},ref_msg:{svr_id:'9007199254740993123'}}]})]);
+  const q=(await s.relay.listPending(s.principal)).requests[0].quoted[0];assert.equal(q.status,hasId?'cached':'not_cached');
+  const read=await s.relay.get(s.principal,{request_id:first});assert.equal(read.reply_text,undefined);assert.equal(s.store.snapshot().requests[first].sentText,hasId?'synthetic reply':undefined);
+ }
+});
+test('bounded completed context evicts body without changing result or blocking new pending',async()=>{
+ const s=setup({retentionMs:Number.MAX_SAFE_INTEGER});let oldest;
+ for(let i=0;i<102;i++){
+  s.advance(1);const rid=await ingest(s,[msg(String(i+1))]);oldest??=rid;
+  await s.relay.reply(s.principal,reply(rid,{idempotency_key:'synthetic_'+i}));
+ }
+ const state=s.store.snapshot();assert.equal(Object.values(state.requests).filter(r=>typeof r.text==='string').length,100);assert.equal(state.requests[oldest].contextEvicted,true);assert.equal(state.intents[oldest].status,'accepted');
+ assert.equal((await s.relay.reply(s.principal,reply(oldest,{idempotency_key:'synthetic_0'}))).duplicate,true);
+ const oversized={requests:{large:{receivedAt:1,status:'answered',text:'x'.repeat(4*1024*1024)}}};s.relay.trimContext(oversized);assert.equal(oversized.requests.large.contextEvicted,true);
+});
+
+test('official nested reference msg_id resolves cache without svr_id, preserving 64-bit string',async()=>{
+ const s=setup();await ingest(s,[msg('9007199254740993123')]);s.advance(1);
+ await ingest(s,[msg('2',{item_list:[{type:1,text_item:{text:'new'},ref_msg:{message_item:{msg_id:'9007199254740993123'}}}]})]);
+ const ref=(await s.relay.listPending(s.principal)).requests.at(-1).quoted[0];assert.equal(ref.server_id,'9007199254740993123');assert.equal(ref.status,'cached');assert.equal(ref.text,BODY);
+ const shape=s.relay.pollStatus().quote_diagnostic;assert.equal(shape.items[0].item_ref.fields.message_item.fields.msg_id,'string');assert.equal(shape.items[0].item_ref.fields.svr_id,undefined);
+});
+test('reference shape diagnoses title, wrong types, alternative nesting without any payload values',async()=>{
+ const s=setup();const raw=msg('2',{ref_msg:{svr_id:'top-private-id'},item_list:[{type:1,text_item:{text:'private new text',ref_msg:{title:'private alternate title'}},ref_msg:{svr_id:null,title:'private title',private_secret_key:'hidden',message_item:{msg_id:{nested:'private value'},text_item:{text:42},type:2}}}]});
+ await ingest(s,[raw]);const diag=s.relay.pollStatus().quote_diagnostic;const repr=JSON.stringify(diag);
+ for(const value of ['top-private-id','private new text','private alternate title','private title','private_secret_key','hidden','private value','synthetic-context-never-export'])assert.ok(!repr.includes(value));
+ assert.equal(diag.message_ref.fields.svr_id,'string');assert.equal(diag.items[0].item_ref.fields.svr_id,'null');assert.equal(diag.items[0].item_ref.fields.message_item.fields.msg_id.type,'object');assert.equal(diag.items[0].item_ref.fields.title,'string');assert.equal(diag.items[0].item_ref.unknown_field_count,1);assert.equal(diag.items[0].text_item_ref.fields.title,'string');
+ const saved=JSON.stringify(diag);await ingest(s,[msg('3',{from_user_id:'other-owner',item_list:raw.item_list})]);assert.equal(JSON.stringify(s.relay.pollStatus().quote_diagnostic),saved);
+ await s.relay.pollOnce(s.principal);assert.equal(JSON.stringify(s.relay.pollStatus().quote_diagnostic),saved);
 });

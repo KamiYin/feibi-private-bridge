@@ -39,18 +39,22 @@ function postHeaders(token){return {'Content-Type':'application/json',Authorizat
   'X-WECHAT-UIN':Buffer.from(String(randomBytes(4).readUInt32BE())).toString('base64'),...commonHeaders(),...(token?{Authorization:`Bearer ${token}`}:{})};}
 
 export class IlinkSession {
-  #request;#approved;#qrGet405Compatibility;#lastHttpStatus=0;#updatesHttpStatus=0;#now;#deadline;#origins;#origin=ILINK_ORIGIN;#nonce;#state='idle';#qr=null;#qrAt=0;
+  #save;#persistent=false;#request;#approved;#qrGet405Compatibility;#lastHttpStatus=0;#updatesHttpStatus=0;#now;#deadline;#origins;#origin=ILINK_ORIGIN;#nonce;#state='idle';#qr=null;#qrAt=0;
   #token=null;#owner=null;#bot=null;#confirmedAt=null;#accessStarted=false;#abort=new AbortController();#busy=false;#pendingOrigin=null;
-  constructor({request,qrApproved=false,qrGet405Compatibility=false,ownerConfirmationNonce,deadline,approvedApiOrigins=[ILINK_ORIGIN],now=Date.now}={}){
+  constructor({request,qrApproved=false,qrGet405Compatibility=false,ownerConfirmationNonce,deadline,approvedApiOrigins=[ILINK_ORIGIN],now=Date.now,persistent=false,restored,onSave}={}){
     this.#request=request??(async()=>fail('REVIEWED_TRANSPORT_REQUIRED'));this.#approved=qrApproved===true;this.#qrGet405Compatibility=qrGet405Compatibility===true;this.#now=now;
-    if(typeof this.#request!=='function'||!nonceValid(ownerConfirmationNonce)||!Number.isSafeInteger(deadline)||deadline<=now()||deadline>now()+420*MINUTE)fail('INVALID_SESSION_CONFIGURATION');
+    if(typeof this.#request!=='function'||!nonceValid(ownerConfirmationNonce)||!Number.isSafeInteger(deadline)||deadline<=now()||(!persistent&&deadline>now()+720*MINUTE))fail('INVALID_SESSION_CONFIGURATION');
     if(!Array.isArray(approvedApiOrigins)||!approvedApiOrigins.length||approvedApiOrigins.length>4)fail('INVALID_SESSION_CONFIGURATION');
     this.#origins=Object.freeze([...new Set(approvedApiOrigins.map(approvedIlinkOrigin))]);
     if(!this.#origins.includes(ILINK_ORIGIN))fail('FIXED_QR_ORIGIN_REQUIRED');
-    this.#deadline=deadline;this.#nonce=ownerConfirmationNonce;
+    this.#deadline=deadline;this.#nonce=ownerConfirmationNonce;this.#persistent=persistent;this.#save=onSave;
+    if(restored){
+      if(!persistent||!opaque(restored.token)||!identifier(restored.owner)||!identifier(restored.bot)||restored.owner===restored.bot||!Number.isSafeInteger(restored.confirmedAt)||restored.confirmedAt>now())fail('INVALID_SAVED_SESSION');
+      this.#origin=this.#validateOrigin(restored.origin);this.#token=restored.token;this.#owner=restored.owner;this.#bot=restored.bot;this.#confirmedAt=restored.confirmedAt;this.#state='connected';this.#nonce=null;
+    }
   }
   status(){return {phase:this.#state,authenticated:this.isAuthenticated(),owner_bound:this.#state==='connected',
-    pending_api_origin:this.#pendingOrigin,last_http_status:this.#lastHttpStatus,storage:'memory_only',personal_message_access_started:this.#accessStarted};}
+    pending_api_origin:this.#pendingOrigin,last_http_status:this.#lastHttpStatus,storage:this.#persistent?'dpapi_current_user':'memory_only',personal_message_access_started:this.#accessStarted};}
   updatesHttpStatus(){return this.#updatesHttpStatus;}
   isAuthenticated(){return this.#state==='connected'&&this.#now()<this.#deadline&&!this.#abort.signal.aborted;}
   bindingForRelay(){if(!this.isAuthenticated())fail('OWNER_CONFIRMATION_REQUIRED');return {ownerUserId:this.#owner,botId:this.#bot,apiOrigin:this.#origin,confirmedAt:this.#confirmedAt};}
@@ -128,7 +132,7 @@ export class IlinkSession {
   });}
   confirmOwner({nonce,userConfirmedScan}={}){
     this.#gate();if(this.#state!=='pending_owner_confirmation'||userConfirmedScan!==true||!equal(nonce,this.#nonce))fail('CURRENT_CHAT_OWNER_CONFIRMATION_REQUIRED');
-    this.#nonce=null;this.#confirmedAt=this.#now();this.#state='connected';return {connected:true,owner_bound:true,storage:'memory_only'};
+    this.#nonce=null;this.#confirmedAt=this.#now();this.#state='connected';this.#save?.({token:this.#token,owner:this.#owner,bot:this.#bot,origin:this.#origin,confirmedAt:this.#confirmedAt});return {connected:true,owner_bound:true,storage:this.#persistent?'dpapi_current_user':'memory_only'};
   }
   async getUpdates(cursor=''){return this.#serial(async()=>{
     if(!this.isAuthenticated())fail('OWNER_CONFIRMATION_REQUIRED');
@@ -143,7 +147,16 @@ export class IlinkSession {
   });}
   async sendText({text,contextToken,clientId}={}){
     if(!this.isAuthenticated())fail('OWNER_CONFIRMATION_REQUIRED');
-    if(typeof text!=='string'||!text.trim()||text.includes('\0')||Buffer.byteLength(text)>3500||!opaque(contextToken)||!identifier(clientId))fail('INVALID_REPLY');
+    if(typeof text!=='string'||!text.trim()||text.includes('\0')||!opaque(contextToken)||!identifier(clientId))fail('INVALID_REPLY');
+    if(Buffer.byteLength(text)>3500){
+      if(!this.#persistent)fail('INVALID_REPLY');
+      const parts=[];let part='',size=0;
+      for(const character of text){const bytes=Buffer.byteLength(character);if(size+bytes>3500){parts.push(part);part='';size=0;}part+=character;size+=bytes;}if(part)parts.push(part);
+      // A failed/uncertain segment stops the group. Relay keeps the whole intent unknown;
+      // automatic replay of earlier accepted segments is never attempted.
+      for(let i=0;i<parts.length;i++)await this.sendText({text:parts[i],contextToken,clientId:clientId+'.'+i});
+      return {accepted:true};
+    }
     const result=await this.#invoke({path:'/ilink/bot/sendmessage',authenticated:true,payload:{msg:{from_user_id:'',to_user_id:this.#owner,client_id:clientId,
       message_type:2,message_state:2,item_list:[{type:1,text_item:{text}}],context_token:contextToken},base_info:baseInfo()}});
     this.#business(result);
@@ -151,5 +164,5 @@ export class IlinkSession {
     // HTTP and nonzero business-error checks. Network failures remain unknown.
     return {accepted:true,...(typeof result.message_id==='string'?{messageId:result.message_id}:{})};
   }
-  stop(){this.#state='stopped';this.#abort.abort();this.#token=null;this.#owner=null;this.#bot=null;this.#qr=null;this.#nonce=null;}
+  stop({preserve=false}={}){if(!preserve)this.#save?.(null);this.#state='stopped';this.#abort.abort();this.#token=null;this.#owner=null;this.#bot=null;this.#qr=null;this.#nonce=null;}
 }

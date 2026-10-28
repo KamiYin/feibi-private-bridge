@@ -16,7 +16,7 @@ function fixture(extra={}){
 }
 test('default no approval/transport and missing current-chat nonce or bounds fail closed',async()=>{
   const s=fixture({qrApproved:false});await assert.rejects(s.start(),e=>e.code==='QR_ACTION_APPROVAL_REQUIRED');assert.equal(s.calls.length,0);
-  for(const extra of [{ownerConfirmationNonce:'bad'},{deadline:1000000},{deadline:26200001},{approvedApiOrigins:['https://evil.test']}])assert.throws(()=>fixture(extra));
+  for(const extra of [{ownerConfirmationNonce:'bad'},{deadline:1000000},{deadline:44200001},{approvedApiOrigins:['https://evil.test']}])assert.throws(()=>fixture(extra));
   const noTransport=new IlinkSession({ownerConfirmationNonce:NONCE,deadline:Date.now()+10000,qrApproved:true});await assert.rejects(noTransport.startQr(),e=>e.code==='ILINK_TRANSPORT_FAILED');
 });
 test('QR fixed POST sends empty token list; secret UI payload returned only to explicit caller; status redacted',async()=>{
@@ -153,11 +153,11 @@ test('receive diagnostics HTTP status belongs to getupdates and resets on transp
  for(const secret of [TOKEN,OWNER,BOT,'private-cursor','private body'])assert.ok(!JSON.stringify(s.session.status()).includes(secret));
 });
 
-test('seven-hour session supports the extended run without extending QR or network timeout',async()=>{
- const s=fixture({deadline:1000000+25200000});await s.connect();s.advance(6*3600000);
+test('twelve-hour session supports the extended run without extending QR or network timeout',async()=>{
+ const s=fixture({deadline:1000000+43200000});await s.connect();s.advance(11*3600000);
  s.respond({ret:0,msgs:[],get_updates_buf:'synthetic-cursor'});await s.session.getUpdates();assert.equal(s.calls.at(-1).timeoutMs,35000);
  s.advance(3600000);await assert.rejects(s.session.getUpdates());assert.equal(s.session.isAuthenticated(),false);
- const qr=fixture({deadline:1000000+25200000});assert.equal((await qr.start()).expiresInMs,300000);
+ const qr=fixture({deadline:1000000+43200000});assert.equal((await qr.start()).expiresInMs,300000);
 });
 
 test('official optional update fields preserve the cursor and absent send ret is success',async()=>{
@@ -167,4 +167,15 @@ test('official optional update fields preserve the cursor and absent send ret is
  s.respond({get_updates_buf:0});await assert.rejects(s.session.getUpdates('previous-cursor'),e=>e.code==='INVALID_UPDATE_RESPONSE');
  s.respond({});assert.equal((await s.session.sendText({text:'synthetic reply',contextToken:'synthetic-context',clientId:'synthetic-client'})).accepted,true);
  s.queue.push(new Error('synthetic network failure'));await assert.rejects(s.session.sendText({text:'synthetic reply',contextToken:'synthetic-context',clientId:'synthetic-client-2'}),e=>e.code==='ILINK_TRANSPORT_FAILED');
+});
+
+test('persistent login restores original binding without QR, preserves on shutdown, clears on revocation',async()=>{
+ let saved;const s=fixture({persistent:true,deadline:253402300799000,onSave:v=>{saved=v;}});await s.connect();assert.ok(saved);const original=s.session.bindingForRelay();s.session.stop({preserve:true});assert.ok(saved);
+ const next=fixture({persistent:true,deadline:253402300799000,restored:saved,onSave:v=>{saved=v;}});assert.equal(next.session.isAuthenticated(),true);assert.deepEqual(next.session.bindingForRelay(),original);assert.equal(next.calls.length,0);assert.equal(next.session.status().storage,'dpapi_current_user');
+ next.queue.push({status:401,body:'{}'});await assert.rejects(next.session.getUpdates());assert.equal(saved,null);
+});
+
+test('persistent long text splits losslessly; failure stops later chunks',async()=>{
+ const s=fixture({persistent:true});await s.connect();const body='文🙂'.repeat(1600);const before=s.calls.length;await s.session.sendText({text:body,contextToken:'synthetic-context',clientId:'synthetic-long'});const sent=s.calls.slice(before).map(c=>JSON.parse(c.body).msg.item_list[0].text_item.text);assert.equal(sent.join(''),body);assert.ok(sent.every(t=>Buffer.byteLength(t)<=3500));
+ s.respond({});s.queue.push(new Error('synthetic_disconnect'));const n=s.calls.length;await assert.rejects(s.session.sendText({text:body,contextToken:'synthetic-context',clientId:'synthetic-fail'}));assert.equal(s.calls.length-n,2);
 });
