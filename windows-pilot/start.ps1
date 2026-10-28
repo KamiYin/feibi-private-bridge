@@ -3,6 +3,7 @@
 [CmdletBinding()]
 param(
   [switch]$Run,
+  [switch]$Persistent,
   [switch]$Standalone,
   [switch]$StandaloneChild,
   [switch]$ValidateStartupOnly,
@@ -18,7 +19,7 @@ param(
   [string]$TunnelId = '',
   [string]$OwnerNonce = '',
   [string]$ExpectedSuffix = '',
-  [ValidateRange(1,25200)][int]$Seconds = 25200,
+  [ValidateRange(1,2147483647)][int]$Seconds = 43200,
   [string]$DeadlineUtc = ''
 )
 Set-StrictMode -Version 2
@@ -123,16 +124,16 @@ function Start-StandaloneHost {
   # only launches it; no input/output redirection or persistent service is used.
   $hostPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $argsText = '-NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File ' + (Quote-Argument $PSCommandPath) + ' -Run -StandaloneChild'
-  foreach ($name in @('NativeClipboard','StoredCredential','ApprovePrivateTunnel','ApproveQrLogin','ApproveOwnerTextTransfer','ApproveOwnerReply')) {
+  foreach ($name in @('Persistent','NativeClipboard','StoredCredential','ApprovePrivateTunnel','ApproveQrLogin','ApproveOwnerTextTransfer','ApproveOwnerReply')) {
     if (Get-Variable -Name $name -ValueOnly) { $argsText += ' -' + $name }
   }
   $argsText += ' -TunnelId ' + (Quote-Argument $TunnelId) + ' -OwnerNonce ' + (Quote-Argument $OwnerNonce) + ' -Seconds ' + $Seconds
   if ($ExpectedSuffix -ne '') { $argsText += ' -ExpectedSuffix ' + (Quote-Argument $ExpectedSuffix) }
   if ($DeadlineUtc -ne '') { $argsText += ' -DeadlineUtc ' + (Quote-Argument $DeadlineUtc) }
-  # This visible window is the operator's interactive status/stop console.
-  $hostProcess = Start-Process -FilePath $hostPath -ArgumentList $argsText -WorkingDirectory $PSScriptRoot -WindowStyle Normal -PassThru
+  # Hidden dedicated console retains stdin and cleanup Job; operator uses file control.
+  $hostProcess = Start-Process -FilePath $hostPath -ArgumentList $argsText -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
   try {
-    Write-Host ((@{event='standalone_host_launched';pid=$hostProcess.Id;backend_started=$false;control='local_console';requested_deadline_utc=$DeadlineUtc;result_file=(Join-Path $PSScriptRoot 'standalone-result.json')} | ConvertTo-Json -Compress))
+    Write-Host ((@{event='standalone_host_launched';pid=$hostProcess.Id;backend_started=$false;control='local_file';window_style='Hidden';requested_deadline_utc=$DeadlineUtc;result_file=(Join-Path $PSScriptRoot 'standalone-result.json')} | ConvertTo-Json -Compress))
   } finally { $hostProcess.Dispose() }
 }
 function Enter-RunInstance {
@@ -267,7 +268,29 @@ function Show-LocalQr([string]$Encoded) {
   $box.SizeMode = 'Zoom'
   $box.Image = $script:qrImage
   $script:qrForm.Controls.Add($box)
+  # The hidden console STARTUPINFO can suppress the first native ShowWindow.
+  # This top-level QR form has no console owner. Explicitly restore only its HWND.
+  if (-not ('FeibiQrWindow' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FeibiQrWindow {
+ [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+ [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+ [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+'@
+  }
+  $script:qrForm.StartPosition = 'CenterScreen'
+  $script:qrForm.ShowInTaskbar = $true
+  $script:qrForm.WindowState = 'Normal'
   $script:qrForm.Show()
+  $null = [FeibiQrWindow]::ShowWindow($script:qrForm.Handle,1)
+  $null = [FeibiQrWindow]::ShowWindow($script:qrForm.Handle,9)
+  $script:qrForm.BringToFront()
+  $script:qrForm.Activate()
+  $null = [FeibiQrWindow]::SetForegroundWindow($script:qrForm.Handle)
+  [Windows.Forms.Application]::DoEvents()
 }
 function Invoke-FileControl([string]$Command) {
   $receiptPath = Join-Path $PSScriptRoot 'standalone-result.json'
@@ -338,6 +361,7 @@ function Get-FeibiCredentialPath {
   return Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'FeibiPrivateBridge\credentials\tunnel-key.dpapi'
 }
 function Get-CredentialExpiry([string]$Value) {
+  if ($Value -ceq 'never') { return [DateTimeOffset]::Parse('9999-12-31T23:59:59.000Z') }
   $expiry = [DateTimeOffset]::MinValue
   if (-not [DateTimeOffset]::TryParseExact($Value,"yyyy-MM-dd'T'HH:mm:ss.fff'Z'",[Globalization.CultureInfo]::InvariantCulture,([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal),[ref]$expiry)) { throw 'STORED_CREDENTIAL_INVALID' }
   if ($expiry -le [DateTimeOffset]::UtcNow) { throw 'STORED_CREDENTIAL_EXPIRED' }
@@ -427,7 +451,7 @@ function Send-Control([string]$Command) {
     'poll'    { $value = @{action='qr_poll'} }
     'confirm' { $value = @{action='confirm_owner';nonce=$OwnerNonce;user_confirmed_scan=$true} }
     'approve' { $value = @{action='approve_callback';origin='https://connectors.api.openai.com'} }
-    'stop'    { $value = @{action='stop'} }
+    'stop'    { if ($Persistent) { [IO.File]::WriteAllText((Join-Path ([IO.Path]::GetDirectoryName((Get-FeibiCredentialPath))) 'operator-stopped'),'stopped') }; $value = @{action='stop'} }
     default  { Write-Host 'Commands: status | approve | qr | poll | confirm | stop'; return }
   }
   Write-PrivateLine $script:process ($value | ConvertTo-Json -Compress)
@@ -654,6 +678,13 @@ public sealed class FeibiControlInput : IDisposable {
     }
     if ($script:runtimeKey -cnotmatch '\Ask-[A-Za-z0-9_-]{20,1021}\z' -or ($ExpectedSuffix -ne '' -and -not $script:runtimeKey.EndsWith($ExpectedSuffix,[StringComparison]::Ordinal))) { throw 'KEY_PASTE_CHECK_FAILED' }
     $bootstrap = @{action='bootstrap';runtime_key=$script:runtimeKey;expected_suffix=$ExpectedSuffix;tunnel_id=$TunnelId;nonce=$OwnerNonce;seconds=$Seconds;directory=$script:directory;routing_snapshot=$routing;acl_verified=$true;tunnel_approved=$true;qr_approved=$true;text_transfer_approved=$true;reply_approved=$true}
+    if ($Persistent) {
+      Initialize-FeibiCredentialDirectory
+      $stateDir = [IO.Path]::GetDirectoryName((Get-FeibiCredentialPath))
+      $bootstrap.persistent = $true; $bootstrap.state_directory = $stateDir
+      $Seconds = [int]::MaxValue
+      $bootstrap.seconds = $Seconds
+    }
     if ($DeadlineUtc -ne '') { $bootstrap.deadline_utc = $DeadlineUtc }
     Assert-ControlInputOpen
     $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -674,7 +705,7 @@ public sealed class FeibiControlInput : IDisposable {
     Assert-ControlInputOpen
     Receive-FileControl
     if ($script:qrDeadline -gt 0 -and $clock.Elapsed.TotalSeconds -ge $script:qrDeadline) { Stop-LocalQr; Write-Host '{"event":"qr_closed","reason":"WINDOWS_QR_DEADLINE"}' }
-    if ($clock.Elapsed.TotalSeconds -ge $Seconds) { Write-Host '{"event":"windows_deadline_reached"}'; break }
+    if (-not $Persistent -and $clock.Elapsed.TotalSeconds -ge $Seconds) { Write-Host '{"event":"windows_deadline_reached"}'; break }
     if ($script:pending.IsCompleted) {
       $message = $script:pending.GetAwaiter().GetResult()
       $script:pending = $null
@@ -682,12 +713,12 @@ public sealed class FeibiControlInput : IDisposable {
       $event = $message | ConvertFrom-Json
       if ($event.event -eq 'private_qr_png') {
         $remaining = [Math]::Min([double]$event.expires_within_seconds,([double]$event.expires_at_unix_ms - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) / 1000)
-        $remaining = [Math]::Min($remaining,$Seconds - $clock.Elapsed.TotalSeconds)
+        if (-not $Persistent) { $remaining = [Math]::Min($remaining,$Seconds - $clock.Elapsed.TotalSeconds) }
         if ($remaining -le 0 -or $remaining -gt 300) { $event.png_base64 = ''; $message = $null; throw 'QR_DATA_REJECTED' }
         Show-LocalQr $event.png_base64
         $script:qrDeadline = $clock.Elapsed.TotalSeconds + $remaining
         $event.png_base64 = ''; $message = $null
-        Write-FileControlResult ([pscustomobject]@{event='operator_result';action='qr_start';result=@{displayed_locally=$true;expires_at_unix_ms=$event.expires_at_unix_ms}})
+        Write-FileControlResult ([pscustomobject]@{event='operator_result';action='qr_start';result=@{displayed_locally=[FeibiQrWindow]::IsWindowVisible($script:qrForm.Handle);window_handle=$script:qrForm.Handle.ToInt64();expires_at_unix_ms=$event.expires_at_unix_ms}})
         Write-Host '{"event":"qr_displayed_locally"}'
       }
       elseif ($event.event -eq 'qr_closed') { Stop-LocalQr; Write-Host $message }

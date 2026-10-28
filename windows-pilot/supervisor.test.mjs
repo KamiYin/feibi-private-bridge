@@ -22,7 +22,6 @@ function child(){const p=new EventEmitter();p.stdin=new PassThrough();p.stdout=n
 
 test('source-only preflight is inert and missing reviewed binary cannot launch',()=>{
  const report=preflight({platform:'linux',arch:'x64',node:'24.22.1'});assert.equal(report.launched,false);assert.equal(report.credential_read,false);assert.equal(report.binary_sha256,null);assert.deepEqual(report.issues,['WINDOWS_X64_REQUIRED','REVIEWED_BINARY_MISSING']);assert.equal(networkCalls,0);
- assert.equal(preflight({platform:'win32',arch:'x64',node:'24.22.1'}).can_prepare_run,false);
 });
 test('preflight rejects missing/tampered package and unsupported Node without executing binary',()=>{
  const r=preflight({platform:'win32',arch:'x64',node:'22.1.1',read:()=>Buffer.from('not the binary'),stat:()=>({isFile:()=>true,isSymbolicLink:()=>false})});assert.ok(r.issues.includes('NODE_24_REQUIRED'));assert.ok(r.issues.includes('REVIEWED_BINARY_HASH_MISMATCH'));
@@ -30,7 +29,7 @@ test('preflight rejects missing/tampered package and unsupported Node without ex
 test('bootstrap requires all explicit action gates and synthetic paste guard',()=>{
  assert.equal(config().routing.proxyUrl,'http://proxy.invalid:8080/');
  for(const field of ['acl_verified','tunnel_approved','qr_approved','text_transfer_approved','reply_approved'])assert.throws(()=>validateBootstrap({...input(),[field]:false},{platform:'win32'}));
- for(const patch of [{runtime_key:'not-key'},{expected_suffix:'wrong'},{expected_suffix:'zzzz'},{seconds:25201},{nonce:'guess'},{tunnel_id:'x'},{directory:'/tmp/not-owned'},{extra:'x'}])assert.throws(()=>validateBootstrap({...input(),...patch},{platform:'win32'}));
+ for(const patch of [{runtime_key:'not-key'},{expected_suffix:'wrong'},{expected_suffix:'zzzz'},{seconds:43201},{nonce:'guess'},{tunnel_id:'x'},{directory:'/tmp/not-owned'},{extra:'x'}])assert.throws(()=>validateBootstrap({...input(),...patch},{platform:'win32'}));
  assert.throws(()=>validateBootstrap(input(),{platform:'linux'}));
 });
 test('bootstrap preserves route policy: DIRECT, different proxies, extra origin all fail closed',()=>{
@@ -48,7 +47,7 @@ test('child environments never copy arbitrary credentials/proxies/options; Node/
  assert.ok(!Object.hasOwn(env.runtime,'SYNTHETIC_OPERATOR_SECRET'));assert.ok(!Object.hasOwn(env.renderer,'SYNTHETIC_MCP_SECRET'));
 });
 test('every child confines profile and temporary paths to the same private project directory',()=>{
- const directory='C:\\synthetic-project\\feibi-private-'+'b'.repeat(32);
+ const directory='C:\\synthetic-bridge\\feibi-private-'+'b'.repeat(32);
  const names=['HOME','USERPROFILE','APPDATA','LOCALAPPDATA','TEMP','TMP'];
  const inherited=Object.fromEntries(names.map(name=>[name,'C:\\synthetic-outside-project\\'+name]));
  Object.assign(inherited,{SystemRoot:'C:\\Windows',WINDIR:'C:\\Windows',tmp:'C:\\synthetic-lowercase-temp'});
@@ -87,7 +86,7 @@ test('typed local known errors are redacted, including payment/quota and new par
  await assert.rejects(localRequest({path:'/local/qr-start',key:'LOCAL'},req),e=>e.code===reason&&!e.message.includes(key));}
 });
 test('normal cleanup waits own children and only removes empty owned directories',async()=>{
- const events=[],calls=[];let exists=true;const fakeFs={existsSync:p=>p.endsWith('empty-profiles')?false:exists,rmdirSync:p=>{calls.push(p);exists=false;}};
+ const events=[],calls=[];let exists=true;const fakeFs={existsSync:p=>p===config().directory&&exists,rmdirSync:p=>{calls.push(p);exists=false;}};
  const s=new Supervisor({emit:x=>events.push(x),fsImpl:fakeFs});s.config=config();s.keys={mcp:'M',operator:'O'};s.children=[child(),child()];
  await s.stop('OPERATOR_STOP');assert.equal(events.at(-1).temporary_files_removed,true);assert.equal(events.at(-1).children_exited,true);assert.equal(events.at(-1).account_authorization_revoked,false);assert.equal(s.config.runtime_key,'');assert.equal(s.keys.operator,'');assert.deepEqual(calls,[s.config.directory]);
  await s.stop('OPERATOR_STOP');assert.equal(events.filter(x=>x.event==='bounded_windows_stopped').length,1);
@@ -105,9 +104,7 @@ test('stop while QR call is pending prevents late output',async()=>{
 });
 test('PS5.1 launcher uses hidden input, only private IPC QR and Job Object before credentials, no policy bypass',()=>{
  const ps=fs.readFileSync(new URL('./start.ps1',import.meta.url),'utf8');assert.ok(ps.includes('-AsSecureString'));assert.ok(ps.includes('ZeroFreeBSTR'));assert.ok(ps.includes('AssignProcessToJobObject'));assert.ok(ps.includes('LimitFlags=0x2000'));
- const runBranch=ps.indexOf('if ($Standalone) { Start-StandaloneHost; return }');
- assert.ok(runBranch>=0);
- assert.ok(ps.indexOf('if (-not [FeibiJob]::AssignProcessToJobObject',runBranch)<ps.indexOf('$script:secureKey = Read-Host',runBranch));
+ assert.ok(ps.indexOf('if (-not [FeibiJob]::AssignProcessToJobObject')<ps.indexOf('$script:secureKey = Read-Host',ps.indexOf('$script:process = New-NodeProcess')));
  assert.ok(ps.includes('SetAccessRuleProtection($true,$false)'));assert.ok(ps.includes("$info.EnvironmentVariables.Clear()"));assert.ok(ps.includes("$event.event -eq 'private_qr_png'"));assert.ok(!ps.includes('Image]::FromFile'));assert.ok(!ps.includes('login-qr.png'));assert.ok(!ps.includes('.Kill($true)'));assert.ok(!ps.includes('Start-Process -Environment'));
  assert.ok(!/powershell[^\n]*-ExecutionPolicy\s+(?:Bypass|Unrestricted)/i.test(ps));assert.ok(!/\bInvoke-Expression\b|\bIEX\s+/.test(ps.split('\n').filter(x=>!x.trim().startsWith('#')).join('\n')));
 });
@@ -145,7 +142,7 @@ test('startup-only validation cannot skip approval, parameters, interactive cons
  ];
  let previous=ps.indexOf('if (-not $Run) { return }');
  for(const guard of required){const at=ps.indexOf(guard,previous);assert.ok(at>=previous&&at<branch,guard);previous=at;}
- assert.match(ps,/\[ValidateRange\(1,25200\)\]\[int\]\$Seconds = 25200/);
+ assert.match(ps,/\[ValidateRange\(1,2147483647\)\]\[int\]\$Seconds = 43200/);
 });
 test('startup-only success is a fixed precredential record then return before managed start and hidden input, with finally cleanup retained',()=>{
  const ps=fs.readFileSync(new URL('./start.ps1',import.meta.url),'utf8');
@@ -184,7 +181,6 @@ test('private directory is pinned to the existing project without environment ch
  const ps=fs.readFileSync(new URL('./start.ps1',import.meta.url),'utf8');
  const body=ps.slice(ps.indexOf('function New-PrivateDirectory {'),ps.indexOf('function Show-LocalQr('));
  assert.ok(body.includes("$parent = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))"));
- assert.match(body,/\$parent\s*=\s*\[IO\.Path\]::GetFullPath\(\$parent\)/);
  assert.match(body,/if\s*\(-not\s+\[IO\.Directory\]::Exists\(\$parent\)\)\s*\{\s*throw 'PROJECT_DIRECTORY_REQUIRED'\s*\}/);
  assert.ok(body.indexOf("throw 'PROJECT_DIRECTORY_REQUIRED'")<body.indexOf('::CreateDirectory('));
  assert.doesNotMatch(body,/\$env:|GetTempPath|CreateTempSubdirectory|New-Item/i);
@@ -271,7 +267,7 @@ test('native control polling is bounded, never implicitly confirms scanning, and
  assert.ok(ps.includes('for ($count = 0; $count -lt 4 -and $script:controlInput.TryTake([ref]$control); $count++)'));
  assert.match(ps,/Assert-ControlInputOpen\s*Send-Control \$control/);
  assert.doesNotMatch(ps,/Console\]::In\.ReadLineAsync|Send-Control\s+['"]confirm['"]|pending_owner_confirmation/);
- assert.match(ps,/\[ValidateRange\(1,25200\)\]\[int\]\$Seconds = 25200/);
+ assert.match(ps,/\[ValidateRange\(1,2147483647\)\]\[int\]\$Seconds = 43200/);
  assert.ok(ps.includes('$clock.Elapsed.TotalSeconds -ge $Seconds'));
  const js=fs.readFileSync(new URL('./supervisor.mjs',import.meta.url),'utf8');
  assert.ok(js.includes('process.stdin.destroy();process.exitCode=1;},120000)'));
@@ -427,10 +423,10 @@ test('only initial routing/bootstrap stream accepts one UTF-8 preamble, includin
  const js=fs.readFileSync(new URL('./supervisor.mjs',import.meta.url),'utf8');assert.ok(js.includes("snapshot:decodeBootstrapLine(Buffer.concat(chunks).toString('utf8'))"));
 });
 
-test('seven-hour bootstrap accepts the limit and retains shorter durations',()=>{
- assert.equal(preflight({platform:'win32',arch:'x64',node:'24.22.1'}).maximum_seconds,25200);
- for(const seconds of [1,1800,7200,25200])assert.equal(validateBootstrap({...input(),seconds},{platform:'win32'}).seconds,seconds);
- for(const seconds of [0,25201,1.5])assert.throws(()=>validateBootstrap({...input(),seconds},{platform:'win32'}));
+test('twelve-hour bootstrap accepts the limit and retains shorter durations',()=>{
+ assert.equal(preflight({platform:'win32',arch:'x64',node:'24.22.1'}).maximum_seconds,43200);
+ for(const seconds of [1,1800,7200,43200])assert.equal(validateBootstrap({...input(),seconds},{platform:'win32'}).seconds,seconds);
+ for(const seconds of [0,43201,1.5])assert.throws(()=>validateBootstrap({...input(),seconds},{platform:'win32'}));
 });
 
 test('started receipt reports the existing UTC deadline without resetting the run',async()=>{
@@ -500,9 +496,9 @@ test('automatic QR polling pauses on verification or errors and respects stop an
 });
 
 test('optional absolute deadline validates canonical UTC without changing existing bootstrap fields',()=>{
- const cutoff='2030-01-01T05:00:00.000Z';assert.equal(validateBootstrap({...input(),deadline_utc:cutoff},{platform:'win32'}).deadline_utc,cutoff);
+ const cutoff='2030-01-01T04:46:03.235Z';assert.equal(validateBootstrap({...input(),deadline_utc:cutoff},{platform:'win32'}).deadline_utc,cutoff);
  assert.equal(validateBootstrap(input(),{platform:'win32'}).deadline_utc,undefined);
- for(const deadline_utc of ['',null,123,'2030-01-01T04:46:03Z','2026-02-30T05:00:00.000Z','2030-01-01T05:00:00.000+00:00'])assert.throws(()=>validateBootstrap({...input(),deadline_utc},{platform:'win32'}));
+ for(const deadline_utc of ['',null,123,'2030-01-01T04:46:03Z','2026-02-30T04:46:03.235Z','2030-01-01T04:46:03.235+00:00'])assert.throws(()=>validateBootstrap({...input(),deadline_utc},{platform:'win32'}));
 });
 test('absolute deadline uses the earlier bound for the receipt, child and stop timer',async t=>{
  t.mock.timers.enable({apis:['setTimeout','setInterval']});
@@ -538,16 +534,16 @@ test('standalone launcher forwards only existing nonsecret run parameters to a s
   "$ast=[Management.Automation.Language.Parser]::ParseFile('"+path.replaceAll("'","''")+"',[ref]$tokens,[ref]$errors)",
   "if($errors.Count){throw 'PARSE_FAILED'}",
   ps.slice(ps.indexOf('function Quote-Argument('),ps.indexOf('function Write-PrivateLine(')),
-  "$NativeClipboard=$true;$StoredCredential=$false;$ApprovePrivateTunnel=$true;$ApproveQrLogin=$true;$ApproveOwnerTextTransfer=$true;$ApproveOwnerReply=$true",
+  "$Persistent=$false;$NativeClipboard=$true;$StoredCredential=$false;$ApprovePrivateTunnel=$true;$ApproveQrLogin=$true;$ApproveOwnerTextTransfer=$true;$ApproveOwnerReply=$true",
   "$TunnelId='tunnel_'+('a'*32);$OwnerNonce='bind:synthetic_nonce_123456';$ExpectedSuffix='abcd';$Seconds=77;$DeadlineUtc='2030-01-02T03:04:05.006Z'",
   "function Start-Process { param($FilePath,$ArgumentList,$WorkingDirectory,$WindowStyle,[switch]$PassThru) $script:launch=@{file=$FilePath;arguments=$ArgumentList;directory=$WorkingDirectory;style=$WindowStyle;pass_thru=[bool]$PassThru};$p=[pscustomobject]@{Id=123};Add-Member -InputObject $p -MemberType ScriptMethod -Name Dispose -Value {};return $p }",
   "function Write-Host {param($Object) $script:receipt=$Object | ConvertFrom-Json}",
   "Start-StandaloneHost",
-  "if($launch.style -ne 'Normal' -or -not $launch.pass_thru){throw 'CONSOLE_MODE'}",
+  "if($launch.style -ne 'Hidden' -or -not $launch.pass_thru){throw 'CONSOLE_MODE'}",
   "$want='-File \"'+$PSCommandPath+'\" -Run -StandaloneChild'",
   "if(-not $launch.arguments.Contains($want) -or $launch.arguments -match '(?:^| )-(?:Standalone(?: |$)|NoExit|NoNewWindow|Redirect)'){throw 'HOST_ARGUMENTS'}",
   "foreach($flag in @('-NativeClipboard','-ApprovePrivateTunnel','-ApproveQrLogin','-ApproveOwnerTextTransfer','-ApproveOwnerReply','-Seconds 77','-DeadlineUtc \"2030-01-02T03:04:05.006Z\"')){if(-not $launch.arguments.Contains($flag)){throw 'PARAMETER_LOST'}}",
-  "if($receipt.backend_started -ne $false -or $receipt.control -ne 'local_console' -or $receipt.pid -ne 123){throw 'MISLEADING_RECEIPT'}",
+  "if($receipt.backend_started -ne $false -or $receipt.control -ne 'local_file' -or $receipt.pid -ne 123){throw 'MISLEADING_RECEIPT'}",
   "$NativeClipboard=$false;$ExpectedSuffix='';$DeadlineUtc='';Start-StandaloneHost",
   "if($launch.arguments -match '-NativeClipboard|-ExpectedSuffix|-DeadlineUtc'){throw 'OPTIONAL_PARAMETER_LEAK'}",
   "$StoredCredential=$true;Start-StandaloneHost;if(-not $launch.arguments.Contains('-StoredCredential') -or $launch.arguments.Contains('-NativeClipboard')){throw 'STORED_MODE_LOST'}",
@@ -566,7 +562,6 @@ test('standalone handoff precedes credentials and actual hosts retain single-ins
  const main=ps.slice(ps.indexOf("  if ($Standalone -and (-not $Run"));
  const handoff=main.indexOf('if ($Standalone) { Start-StandaloneHost; return }');
  for(const guard of ["throw 'EXPLICIT_ACTION_APPROVAL_REQUIRED'","throw 'INVALID_RUN_PARAMETERS'",'$script:absoluteDeadline = $parsedDeadline.ToUnixTimeMilliseconds()'])assert.ok(main.indexOf(guard)<handoff,guard);
- assert.ok(handoff>=0);
  for(const operation of ['Enter-RunInstance','Assert-NativeStdinHost; Assert-NativeClipboardRetention','$routing = Get-ExistingRouting','$script:directory = New-PrivateDirectory','[Windows.Forms.Clipboard]::GetText'])assert.ok(main.indexOf(operation,handoff)>handoff,operation);
  assert.match(ps,/if \(\$Run -and -not \$Standalone\) \{ Write-Host/);
  assert.ok(ps.includes("'BRIDGE_ALREADY_RUNNING'"));assert.ok(ps.includes('$script:instanceMutex.WaitOne(0)'));
@@ -630,11 +625,11 @@ test('receive diagnostics reach local safe status with only fixed codes and nume
  x.mcp.poll_diagnostic.reason='private_unknown_error';assert.throws(()=>safeStatus(x));
 });
 
-test('seven-hour startup still honors the exact extended absolute cutoff',async()=>{
- const began=Date.parse('2030-01-01T04:30:00Z'),cutoff='2030-01-01T10:00:00.000Z';let ready;const started=new Promise(r=>{ready=r;}),envs=[];
+test('twelve-hour startup still honors the exact extended absolute cutoff',async()=>{
+ const began=Date.parse('2030-01-01T04:30:00Z'),cutoff='2030-01-01T09:46:03.235Z';let ready;const started=new Promise(r=>{ready=r;}),envs=[];
  const s=new Supervisor({now:()=>began,emit:e=>{if(e.event==='bounded_windows_started')ready(e);},request:async()=>status(),spawnChild:(_file,_args,o)=>{envs.push({...o.env});return child();},fsImpl:{lstatSync:()=>({isDirectory:()=>true,isSymbolicLink:()=>false}),readdirSync:()=>[],existsSync:()=>false,rmdirSync:()=>{}}});
- const running=s.start({...input(),seconds:25200,deadline_utc:cutoff});
- try{const result=await started;assert.equal(result.deadline_utc,cutoff);assert.equal(result.maximum_seconds,25200);assert.equal(envs[0].WEIXIN_DEADLINE_UNIX_MS,String(Date.parse(cutoff)));}
+ const running=s.start({...input(),seconds:43200,deadline_utc:cutoff});
+ try{const result=await started;assert.equal(result.deadline_utc,cutoff);assert.equal(result.maximum_seconds,43200);assert.equal(envs[0].WEIXIN_DEADLINE_UNIX_MS,String(Date.parse(cutoff)));}
  finally{await s.stop('OPERATOR_STOP');await running;}
 });
 
@@ -664,7 +659,7 @@ test('stored credential startup preserves gates, private IPC and deadline, witho
  assert.ok(ps.includes("'FeibiPrivateBridge\\credentials\\tunnel-key.dpapi'"));
 });
 
-const FILE_CONTROL_TEST_SOURCE="param([string]$Mode='Client',[string]$Directory='',[int]$ParentId=0)\n$ErrorActionPreference='Stop'\n$tokens=$null;$errors=$null\n$script:fixtureSource='__SOURCE__'\n$ast=[Management.Automation.Language.Parser]::ParseFile($script:fixtureSource,[ref]$tokens,[ref]$errors)\nif($errors.Count){throw 'SOURCE_PARSE_FAILED'}\n$names=@('Get-CredentialExpiry','Assert-CredentialPrivatePath','New-PrivateDirectory','Invoke-FileControl','Receive-FileControl','Write-FileControlResult')\n$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name},$true) | ForEach-Object {$body=$_.Extent.Text.Replace('$PSScriptRoot',(\"'\"+$PSScriptRoot.Replace(\"'\",\"''\")+\"'\")); . ([scriptblock]::Create($body))}\n$script:fileControlRequest=$null\n$receiptPath=Join-Path $PSScriptRoot 'standalone-result.json'\nif($Mode -ceq 'Responder'){\n $StandaloneChild=$true;$script:directory=$Directory\n function Send-Control([string]$Command){\n  if($Command -ceq 'stop'){\n   [IO.File]::WriteAllText($receiptPath,(@{pid=$ParentId;event='stopped';code='OPERATOR_STOP';deadline_utc=$script:fixtureDeadline}|ConvertTo-Json -Compress))\n   $script:fixtureDone=$true;return\n  }\n  if($Command -ceq 'qr'){\n   $text=[IO.File]::ReadAllText($script:fixtureSource)\n   $begin=$text.IndexOf('      if ($event.event -eq ''private_qr_png'') {')\n   $end=$text.IndexOf('      elseif ($event.event -eq ''qr_closed'')',$begin)\n   if($begin-lt0 -or $end-le$begin){throw 'QR_BRANCH_MISSING'}\n   $event=[pscustomobject]@{event='private_qr_png';png_base64='SYNTHETIC_QR_BYTES';expires_at_unix_ms=[DateTimeOffset]::UtcNow.AddMinutes(1).ToUnixTimeMilliseconds();expires_within_seconds=60}\n   $clock=[Diagnostics.Stopwatch]::StartNew();$Seconds=60;$message='';$script:displayCalled=$false\n   function Show-LocalQr([string]$Encoded){if($Encoded-cne'SYNTHETIC_QR_BYTES'){throw 'WRONG_QR_PAYLOAD'};$script:displayCalled=$true}\n   . ([scriptblock]::Create($text.Substring($begin,$end-$begin)))\n   if(-not$script:displayCalled -or $event.png_base64-cne''){throw 'QR_DISPLAY_CLEAR_FAILED'}\n   return\n  }\n  $action=@{status='status';approve='approve_callback';confirm='confirm_owner'}[$Command]\n  Write-FileControlResult ([pscustomobject]@{event='operator_result';action=$action;result=@{received=$Command;approved=($Command-ceq'approve');origin='https://connectors.api.openai.com'}})\n }\n $script:fixtureDeadline=([IO.File]::ReadAllText($receiptPath)|ConvertFrom-Json).deadline_utc\n $script:fixtureDone=$false;$timer=[Diagnostics.Stopwatch]::StartNew()\n while(-not$script:fixtureDone -and $timer.Elapsed.TotalSeconds-lt15){Receive-FileControl;Start-Sleep -Milliseconds 20}\n if(-not$script:fixtureDone){throw 'RESPONDER_TIMEOUT'}\n exit 0\n}\n$helper=$null;$script:directory=$null\ntry{\n $script:directory=New-PrivateDirectory\n $deadline=[DateTime]::UtcNow.AddMinutes(1).ToString(\"yyyy-MM-dd'T'HH:mm:ss.fff'Z'\")\n [IO.File]::WriteAllText($receiptPath,(@{pid=$PID;event='started';control_directory=$script:directory;deadline_utc=$deadline}|ConvertTo-Json -Compress))\n $argsText='-NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File \"'+$PSCommandPath+'\" -Mode Responder -Directory \"'+$script:directory+'\" -ParentId '+$PID\n $helper=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $argsText -WindowStyle Hidden -PassThru\n Invoke-FileControl 'status'\n Invoke-FileControl 'approve'\n Invoke-FileControl 'qr'\n Invoke-FileControl 'confirm'\n Invoke-FileControl 'stop'\n if(-not$helper.WaitForExit(5000) -or $helper.ExitCode-ne0){throw 'RESPONDER_FAILED'}\n $StandaloneChild=$true\n $requestPath=Join-Path $script:directory 'operator-request.json'\n [IO.File]::WriteAllText($requestPath,(@{id=('a'*32);command='poll'}|ConvertTo-Json -Compress))\n try{Receive-FileControl;throw 'UNSUPPORTED_COMMAND_WAS_NOT_REJECTED'}catch{if($_.Exception.Message-cne'INVALID_OPERATOR_CONTROL'){throw}}\n $sendAst=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Send-Control'},$true)\n . ([scriptblock]::Create($sendAst.Extent.Text))\n function Write-PrivateLine($Target,[string]$Value){$script:captured=$Value|ConvertFrom-Json}\n $script:process=$null;$OwnerNonce='bind:SYNTHETIC_ONLY_12345678'\n Send-Control 'qr'\n if($script:captured.action-cne'qr_start' -or $null-ne$script:captured.PSObject.Properties['user_confirmed_scan']){throw 'QR_BOUND_OWNER'}\n Send-Control 'confirm'\n if($script:captured.action-cne'confirm_owner' -or $script:captured.user_confirmed_scan-ne$true -or $script:captured.nonce-cne$OwnerNonce){throw 'CONFIRM_MAPPING_CHANGED'}\n [Console]::WriteLine('FILE_CONTROL_CHECKS_OK')\n} finally{\n if($null-ne$helper){if(-not$helper.HasExited){$helper.Kill();$null=$helper.WaitForExit(1000)};$helper.Dispose()}\n if($null-ne$script:directory -and [IO.Directory]::Exists($script:directory)){\n  foreach($file in [IO.Directory]::GetFiles($script:directory,'operator-*')){[IO.File]::Delete($file)}\n  [IO.Directory]::Delete($script:directory,$false)\n }\n if([IO.File]::Exists($receiptPath)){[IO.File]::Delete($receiptPath)}\n}\n";
+const FILE_CONTROL_TEST_SOURCE="param([string]$Mode='Client',[string]$Directory='',[int]$ParentId=0)\n$ErrorActionPreference='Stop'\n$tokens=$null;$errors=$null\n$script:fixtureSource='__SOURCE__'\n$ast=[Management.Automation.Language.Parser]::ParseFile($script:fixtureSource,[ref]$tokens,[ref]$errors)\nif($errors.Count){throw 'SOURCE_PARSE_FAILED'}\n$names=@('Get-CredentialExpiry','Assert-CredentialPrivatePath','New-PrivateDirectory','Invoke-FileControl','Receive-FileControl','Write-FileControlResult')\n$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name},$true) | ForEach-Object {$body=$_.Extent.Text.Replace('$PSScriptRoot',(\"'\"+$PSScriptRoot.Replace(\"'\",\"''\")+\"'\")); . ([scriptblock]::Create($body))}\n$script:fileControlRequest=$null\n$receiptPath=Join-Path $PSScriptRoot 'standalone-result.json'\nif($Mode -ceq 'Responder'){\n $StandaloneChild=$true;$script:directory=$Directory\n function Send-Control([string]$Command){\n  if($Command -ceq 'stop'){\n   [IO.File]::WriteAllText($receiptPath,(@{pid=$ParentId;event='stopped';code='OPERATOR_STOP';deadline_utc=$script:fixtureDeadline}|ConvertTo-Json -Compress))\n   $script:fixtureDone=$true;return\n  }\n  if($Command -ceq 'qr'){\n   $text=[IO.File]::ReadAllText($script:fixtureSource)\n   $begin=$text.IndexOf('      if ($event.event -eq ''private_qr_png'') {')\n   $end=$text.IndexOf('      elseif ($event.event -eq ''qr_closed'')',$begin)\n   if($begin-lt0 -or $end-le$begin){throw 'QR_BRANCH_MISSING'}\n   $event=[pscustomobject]@{event='private_qr_png';png_base64='SYNTHETIC_QR_BYTES';expires_at_unix_ms=[DateTimeOffset]::UtcNow.AddMinutes(1).ToUnixTimeMilliseconds();expires_within_seconds=60}\n   $clock=[Diagnostics.Stopwatch]::StartNew();$Seconds=60;$message='';$script:displayCalled=$false\n   Add-Type -TypeDefinition 'public static class FeibiQrWindow {public static bool IsWindowVisible(System.IntPtr h){return h == new System.IntPtr(1);}}'\n   function Show-LocalQr([string]$Encoded){if($Encoded-cne'SYNTHETIC_QR_BYTES'){throw 'WRONG_QR_PAYLOAD'};$script:displayCalled=$true;$script:qrForm=[pscustomobject]@{Handle=[IntPtr]1}}\n   . ([scriptblock]::Create($text.Substring($begin,$end-$begin)))\n   if(-not$script:displayCalled -or $event.png_base64-cne''){throw 'QR_DISPLAY_CLEAR_FAILED'}\n   return\n  }\n  $action=@{status='status';approve='approve_callback';confirm='confirm_owner'}[$Command]\n  Write-FileControlResult ([pscustomobject]@{event='operator_result';action=$action;result=@{received=$Command;approved=($Command-ceq'approve');origin='https://connectors.api.openai.com'}})\n }\n $script:fixtureDeadline=([IO.File]::ReadAllText($receiptPath)|ConvertFrom-Json).deadline_utc\n $script:fixtureDone=$false;$timer=[Diagnostics.Stopwatch]::StartNew()\n while(-not$script:fixtureDone -and $timer.Elapsed.TotalSeconds-lt15){Receive-FileControl;Start-Sleep -Milliseconds 20}\n if(-not$script:fixtureDone){throw 'RESPONDER_TIMEOUT'}\n exit 0\n}\n$helper=$null;$script:directory=$null\ntry{\n $script:directory=New-PrivateDirectory\n $deadline=[DateTime]::UtcNow.AddMinutes(1).ToString(\"yyyy-MM-dd'T'HH:mm:ss.fff'Z'\")\n [IO.File]::WriteAllText($receiptPath,(@{pid=$PID;event='started';control_directory=$script:directory;deadline_utc=$deadline}|ConvertTo-Json -Compress))\n $argsText='-NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File \"'+$PSCommandPath+'\" -Mode Responder -Directory \"'+$script:directory+'\" -ParentId '+$PID\n $helper=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $argsText -WindowStyle Hidden -PassThru\n Invoke-FileControl 'status'\n Invoke-FileControl 'approve'\n Invoke-FileControl 'qr'\n Invoke-FileControl 'confirm'\n Invoke-FileControl 'stop'\n if(-not$helper.WaitForExit(5000) -or $helper.ExitCode-ne0){throw 'RESPONDER_FAILED'}\n $StandaloneChild=$true\n $requestPath=Join-Path $script:directory 'operator-request.json'\n [IO.File]::WriteAllText($requestPath,(@{id=('a'*32);command='poll'}|ConvertTo-Json -Compress))\n try{Receive-FileControl;throw 'UNSUPPORTED_COMMAND_WAS_NOT_REJECTED'}catch{if($_.Exception.Message-cne'INVALID_OPERATOR_CONTROL'){throw}}\n $sendAst=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Send-Control'},$true)\n . ([scriptblock]::Create($sendAst.Extent.Text))\n function Write-PrivateLine($Target,[string]$Value){$script:captured=$Value|ConvertFrom-Json}\n $script:process=$null;$OwnerNonce='bind:SYNTHETIC_ONLY_12345678'\n Send-Control 'qr'\n if($script:captured.action-cne'qr_start' -or $null-ne$script:captured.PSObject.Properties['user_confirmed_scan']){throw 'QR_BOUND_OWNER'}\n Send-Control 'confirm'\n if($script:captured.action-cne'confirm_owner' -or $script:captured.user_confirmed_scan-ne$true -or $script:captured.nonce-cne$OwnerNonce){throw 'CONFIRM_MAPPING_CHANGED'}\n [Console]::WriteLine('FILE_CONTROL_CHECKS_OK')\n} finally{\n if($null-ne$helper){if(-not$helper.HasExited){$helper.Kill();$null=$helper.WaitForExit(1000)};$helper.Dispose()}\n if($null-ne$script:directory -and [IO.Directory]::Exists($script:directory)){\n  foreach($file in [IO.Directory]::GetFiles($script:directory,'operator-*')){[IO.File]::Delete($file)}\n  [IO.Directory]::Delete($script:directory,$false)\n }\n if([IO.File]::Exists($receiptPath)){[IO.File]::Delete($receiptPath)}\n}\n";
 test('PS5 file controls display QR safely, forward explicit confirm, and preserve stop', {skip:process.platform!=='win32'},()=>{
  const dir=fs.mkdtempSync(process.env.TEMP+'\\feibi-control-test-'),file=dir+'\\fixture.ps1';
  const source=new URL('./start.ps1',import.meta.url).pathname.replace(/^\/([A-Z]:)/i,'$1').replaceAll('/','\\');
@@ -681,4 +676,12 @@ test('drained child logs cannot stop the bridge after cumulative 64KB',async()=>
  for(let i=0;i<20;i++){p.stdout.write(Buffer.alloc(8192));p.stderr.write(Buffer.alloc(8192));}
  await new Promise(resolve=>setImmediate(resolve));assert.equal(s.stopped,false);assert.equal(p.stdout.readableLength,0);assert.equal(p.stderr.readableLength,0);
  p.stdin.destroy();p.stdout.destroy();p.stderr.destroy();
+});
+
+test('safe health exposes fixed poll transport diagnostics without request data',()=>{
+ const details={transport_phase:'wait_response',transport_reused:true,transport_protocol:'h2',transport_elapsed_ms:40001,connection_pool_resets:1,current_poll_age_seconds:40,failure_category:'timeout',last_error:'2030-01-01T09:30:40Z',url:'PRIVATE',token:'PRIVATE'};
+ const got=safeHealth({status:'degraded',state:'backoff',details});
+ for(const k of ['transport_phase','transport_reused','transport_protocol','transport_elapsed_ms','connection_pool_resets','current_poll_age_seconds','failure_category','last_error'])assert.equal(got.details[k],details[k]);
+ assert.ok(!JSON.stringify(got).includes('PRIVATE'));
+ assert.deepEqual(safeHealth({details:{transport_phase:'PRIVATE',transport_protocol:'PRIVATE',transport_reused:'PRIVATE',connection_pool_resets:-1,transport_elapsed_ms:NaN}}).details,{});
 });

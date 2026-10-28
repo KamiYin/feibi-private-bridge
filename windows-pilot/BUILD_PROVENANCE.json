@@ -10,8 +10,24 @@
   "GOPROXY": "off",
   "GOTOOLCHAIN": "local",
   "CGO_ENABLED": "0",
-  "binary_sha256": "30e10e36956085c6c73f88e30942d1b96c2645f1ad6cea3b7697cb2de5ce5c48",
+  "binary_sha256": "e607591deed958e2e324a9246b2683c727405bcbe69164d45cc67137db5d4e5f",
   "windows_execution_tested": false,
   "dependency_license_count": 74,
-  "missing_dependency_license_roots": []
+  "missing_dependency_license_roots": [],
+  "local_patches": [
+    "origin-guard.patch",
+    "poll-connection-recovery.patch"
+  ],
+  "runtime_version": "0.0.18-local-poll-recovery.3",
+  "windows_version_command_tested": true,
+  "live_network_tested": false,
+  "source_archive_sha256": "88c07f33188aa54ed04c8ef9c99b6ba309e9d07634f7c604ad90e78e998ed8dc",
+  "go_toolchain_sha256": "f26081f438319757f8a1b46d7d0b2c5ec7583d4038e485e0aa725cfde7885fff",
+  "targeted_tests": {
+    "current_go_command": "go test ./pkg/controlplane/internal -run TestPollRecovery|TestPollPool|TestPollTrace -count=1 -timeout=60s",
+    "current_go_result": "PASS 2.471s",
+    "prior_validation": "Reuse .2 classification/Poller and existing origin/redirect/privacy/Node evidence",
+    "failures": 0
+  },
+  "build_command": "go build -trimpath -buildvcs=false -ldflags \"-s -w -X github.com/openai/tunnel-client/pkg/version.semanticVersion=0.0.18-local-poll-recovery.3 -X github.com/openai/tunnel-client/pkg/version.GitSHA=274a5588414819f063d27100a4fb1096aae3830f -X github.com/openai/tunnel-client/pkg/version.Flavor=runtime\" ./cmd/client-runtime"
 }

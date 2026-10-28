@@ -1,0 +1,663 @@
+diff --git a/pkg/controlplane/health.go b/pkg/controlplane/health.go
+index df6a5bd..88230f6 100644
+--- a/pkg/controlplane/health.go
++++ b/pkg/controlplane/health.go
+@@ -38,6 +38,10 @@ type PollHealth struct {
+ 	configuredWait, effectiveWait, deadline                    time.Duration
+ 	category                                                   string
+ 	httpStatus                                                 int
++	transportPhase, transportProtocol                          string
++	transportReused                                            bool
++	transportElapsedMS                                         int64
++	connectionPoolResets                                       uint64
+ }
+ 
+ func NewPollHealth(cfg *runtimeconfig.ControlPlaneConfig) *PollHealth {
+@@ -105,6 +109,26 @@ func (s *PollHealth) Stopped(now time.Time) {
+ 	defer s.signal()
+ 	s.state, s.observedAt, s.nextRetry = "stopped", now, time.Time{}
+ }
++
++// TransportObservation retains only fixed phases, protocol, timing and reuse.
++func (s *PollHealth) TransportObservation(phase string, reused bool, protocol string, elapsed time.Duration) {
++	if s == nil {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	defer s.signal()
++	s.transportPhase, s.transportReused, s.transportProtocol, s.transportElapsedMS = phase, reused, protocol, elapsed.Milliseconds()
++}
++func (s *PollHealth) ConnectionPoolReset() {
++	if s == nil {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	defer s.signal()
++	increment(&s.connectionPoolResets)
++}
+ func (s *PollHealth) Snapshot(now time.Time) healthstate.ComponentSnapshot {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+@@ -122,6 +146,7 @@ func (s *PollHealth) Snapshot(now time.Time) healthstate.ComponentSnapshot {
+ 		LastAttempt: timestamp(s.lastAttempt), LastSuccess: timestamp(s.lastSuccess), LastError: timestamp(s.lastError), ConsecutiveFailures: s.failures,
+ 		CurrentPollAgeSeconds: age, ConfiguredWaitSeconds: s.configuredWait.Seconds(), EffectiveWaitSeconds: s.effectiveWait.Seconds(), DeadlineSeconds: s.deadline.Seconds(),
+ 		NextRetry: timestamp(s.nextRetry), FailureCategory: s.category, HTTPStatus: s.httpStatus,
++		TransportPhase: s.transportPhase, TransportReused: s.transportReused, TransportProtocol: s.transportProtocol, TransportElapsedMS: s.transportElapsedMS, ConnectionPoolResets: s.connectionPoolResets,
+ 	}}
+ }
+ 
+diff --git a/pkg/controlplane/internal/poll_connection_pool.go b/pkg/controlplane/internal/poll_connection_pool.go
+new file mode 100644
+index 0000000..16c8128
+--- /dev/null
++++ b/pkg/controlplane/internal/poll_connection_pool.go
+@@ -0,0 +1,59 @@
++package internal
++
++import (
++	"context"
++	"net/http"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// pollConnectionPool sits below auth/metrics wrappers. Retiring it never
++// replays an in-flight request.
++type pollConnectionPool struct {
++	current   atomic.Pointer[http.Transport]
++	mu        sync.Mutex
++	deadlines int
++}
++
++func newPollConnectionPool(transport *http.Transport) *pollConnectionPool {
++	p := &pollConnectionPool{}
++	p.current.Store(transport)
++	return p
++}
++func (p *pollConnectionPool) RoundTrip(req *http.Request) (*http.Response, error) {
++	return p.current.Load().RoundTrip(req)
++}
++func (p *pollConnectionPool) CloseIdleConnections() { p.current.Load().CloseIdleConnections() }
++func (p *pollConnectionPool) observePoll(deadline bool) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if !deadline {
++		p.deadlines = 0
++		return false
++	}
++	p.deadlines++
++	if p.deadlines < 1 {
++		return false
++	}
++	p.deadlines = 0
++	old := p.current.Load()
++	// Clone retains proxy, CA, mTLS, dial and protocol configuration, but has a
++	// fresh pool. Active response uploads finish on the retired transport.
++	p.current.Store(old.Clone())
++	// Reach the actual transport, independent of outer wrapper forwarding.
++	old.CloseIdleConnections()
++	return true
++}
++
++// pollAttemptContext distinguishes the poller's own deadline from cancellation
++// of the runtime that owns it. The fetcher still receives a bounded context.
++type pollAttemptContext struct {
++	context.Context
++	parent context.Context
++}
++
++func newPollAttemptContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
++	bounded, cancel := context.WithTimeout(parent, timeout)
++	return pollAttemptContext{Context: bounded, parent: parent}, cancel
++}
+diff --git a/pkg/controlplane/internal/poll_connection_pool_test.go b/pkg/controlplane/internal/poll_connection_pool_test.go
+new file mode 100644
+index 0000000..90c2d8f
+--- /dev/null
++++ b/pkg/controlplane/internal/poll_connection_pool_test.go
+@@ -0,0 +1,273 @@
++package internal
++
++import (
++	"context"
++	"crypto/x509"
++	"errors"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/http/httptrace"
++	"net/url"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/openai/tunnel-client/pkg/config"
++	"github.com/openai/tunnel-client/pkg/controlplane"
++	"github.com/openai/tunnel-client/pkg/healthstate"
++	"github.com/openai/tunnel-client/pkg/tlsconfig"
++	"github.com/openai/tunnel-client/pkg/tunnelctx"
++	"github.com/openai/tunnel-client/pkg/types"
++	"github.com/stretchr/testify/require"
++)
++
++func recoveryClient(t *testing.T, server *httptest.Server) (*TunnelServiceClient, *controlplane.PollHealth) {
++	t.Helper()
++	roots := x509.NewCertPool()
++	roots.AddCert(server.Certificate())
++	cfg := &config.ControlPlaneConfig{BaseURL: mustParseURL(t, server.URL), TunnelID: "test-tunnel", APIKey: "synthetic-test-key", PollTimeout: 2 * time.Second, PollDeadlineGuardrail: time.Second, SuppressRawHTTPLogging: true}
++	c, err := NewTunnelServiceClient(t.Context(), cfg, &tlsconfig.Bundle{RootCAs: roots}, newDiscardLogger(), &config.LoggingConfig{}, testMeterProvider)
++	require.NoError(t, err)
++	require.NotNil(t, c.pollPool)
++	health := controlplane.NewPollHealth(cfg)
++	c.ObserveHealth(health, nil)
++	t.Cleanup(c.pollPool.CloseIdleConnections)
++	return c, health
++}
++
++// Real HTTP/2 streams reuse the first TCP connection across deadlines. Recovery
++// must replace the underlying pool through all production middleware.
++func TestPollRecoveryReplacesHTTP2PoolWithoutReplayingResponse(t *testing.T) {
++	var stalled atomic.Bool
++	var postCount atomic.Int32
++	seen := make(chan string, 10)
++	postStarted, releasePost := make(chan struct{}), make(chan struct{})
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.ProtoMajor != 2 {
++			t.Errorf("expected HTTP/2, got %s", r.Proto)
++		}
++		if r.Header.Get("Authorization") != "Bearer synthetic-test-key" {
++			t.Error("authentication not preserved")
++		}
++		if strings.HasSuffix(r.URL.Path, "/response") {
++			postCount.Add(1)
++			close(postStarted)
++			select {
++			case <-releasePost:
++				w.WriteHeader(200)
++			case <-r.Context().Done():
++			}
++			return
++		}
++		seen <- r.RemoteAddr
++		if stalled.Load() {
++			<-r.Context().Done()
++			return
++		}
++		w.WriteHeader(204)
++	}))
++	server.EnableHTTP2 = true
++	server.StartTLS()
++	defer server.Close()
++	defer func() {
++		select {
++		case <-releasePost:
++		default:
++			close(releasePost)
++		}
++	}()
++	c, health := recoveryClient(t, server)
++	_, _, err := c.Poll(t.Context(), 1)
++	require.NoError(t, err)
++	first := <-seen
++	original := c.pollPool.current.Load()
++	postDone := make(chan error, 1)
++	go func() {
++		ctx := tunnelctx.ContextWithChannel(tunnelctx.ContextWithShardToken(t.Context(), "synthetic-shard"), types.DefaultChannel)
++		_, err := c.PostResponse(ctx, "synthetic-request", types.NewNotificationAck(types.DefaultChannel, http.StatusOK, http.Header{}))
++		postDone <- err
++	}()
++	<-postStarted
++	stalled.Store(true)
++	c.pollTimeout, c.pollGuardrail = 300*time.Millisecond, 200*time.Millisecond
++	for i := 0; i < 1; i++ {
++		_, _, err = c.Poll(t.Context(), 1)
++		require.ErrorIs(t, err, context.DeadlineExceeded)
++		require.Equal(t, first, <-seen, "pre-recovery polls should reuse the established connection")
++	}
++	d := health.Snapshot(time.Now()).Details.(healthstate.PollingDetails)
++	require.EqualValues(t, 1, d.ConnectionPoolResets)
++	require.Equal(t, "wait_response", d.TransportPhase)
++	require.Equal(t, "h2", d.TransportProtocol)
++	require.True(t, d.TransportReused)
++	require.GreaterOrEqual(t, d.TransportElapsedMS, int64(450))
++	require.NotSame(t, original, c.pollPool.current.Load())
++	require.False(t, c.pollPool.current.Load().TLSClientConfig.InsecureSkipVerify)
++	require.Equal(t, original.TLSClientConfig.RootCAs, c.pollPool.current.Load().TLSClientConfig.RootCAs)
++	stalled.Store(false)
++	_, _, err = c.Poll(t.Context(), 1)
++	require.NoError(t, err)
++	require.NotEqual(t, first, <-seen, "next poll must use a new TCP connection")
++	d = health.Snapshot(time.Now()).Details.(healthstate.PollingDetails)
++	require.False(t, d.TransportReused)
++	require.Equal(t, "h2", d.TransportProtocol)
++	close(releasePost)
++	require.NoError(t, <-postDone, "active response upload must finish on its original connection")
++	require.EqualValues(t, 1, postCount.Load(), "pool recovery must not replay responses")
++	original.CloseIdleConnections()
++}
++
++func TestPollRecoveryOnlyCountsOwnDeadlines(t *testing.T) {
++	var mode atomic.Int32
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch mode.Load() {
++		case 1:
++			<-r.Context().Done()
++		case 2:
++			w.WriteHeader(503)
++		default:
++			time.Sleep(10 * time.Millisecond)
++			w.WriteHeader(204)
++		}
++	}))
++	server.EnableHTTP2 = true
++	server.StartTLS()
++	defer server.Close()
++	c, health := recoveryClient(t, server)
++	_, _, err := c.Poll(t.Context(), 1)
++	require.NoError(t, err)
++	c.pollTimeout, c.pollGuardrail = 50*time.Millisecond, 50*time.Millisecond
++	timeout := func() {
++		t.Helper()
++		mode.Store(1)
++		_, _, err := c.Poll(t.Context(), 1)
++		require.ErrorIs(t, err, context.DeadlineExceeded)
++	}
++	resets := func() uint64 {
++		return health.Snapshot(time.Now()).Details.(healthstate.PollingDetails).ConnectionPoolResets
++	}
++	mode.Store(0)
++	_, _, err = c.Poll(t.Context(), 1)
++	require.NoError(t, err)
++	require.Zero(t, resets(), "successful empty long poll must not recycle the pool")
++	mode.Store(2)
++	_, _, err = c.Poll(t.Context(), 1)
++	require.Error(t, err)
++	require.False(t, errors.Is(err, context.DeadlineExceeded))
++	require.Zero(t, resets(), "HTTP errors are not local deadlines")
++	mode.Store(1)
++	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
++	_, _, err = c.Poll(ctx, 1)
++	cancel()
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++	require.Zero(t, resets(), "parent deadline must not recycle the pool")
++	ctx, cancel = context.WithCancel(t.Context())
++	started := make(chan struct{})
++	c.client.Transport = cancelAfterStartTransport{base: c.client.Transport, started: started}
++	go func() { <-started; cancel() }()
++	_, _, err = c.Poll(ctx, 1)
++	require.ErrorIs(t, err, context.Canceled)
++	require.Zero(t, resets(), "parent cancellation must not recycle the pool")
++	require.Zero(t, resets())
++	timeout()
++	require.EqualValues(t, 1, resets())
++}
++
++func TestPollPoolClosesActualIdleConnectionAndPreservesProxy(t *testing.T) {
++	closed := make(chan struct{}, 4)
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
++	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
++		if state == http.StateClosed {
++			closed <- struct{}{}
++		}
++	}
++	server.Start()
++	defer server.Close()
++	var proxyCalls atomic.Int32
++	base := http.DefaultTransport.(*http.Transport).Clone()
++	base.Proxy = func(r *http.Request) (*url.URL, error) { proxyCalls.Add(1); return nil, nil }
++	pool := newPollConnectionPool(base)
++	t.Cleanup(pool.CloseIdleConnections)
++	client := &http.Client{Transport: newResponseReceiptRoundTripper(pool)}
++	res, err := client.Get(server.URL)
++	require.NoError(t, err)
++	require.NoError(t, res.Body.Close())
++	require.True(t, pool.observePoll(true))
++	select {
++	case <-closed:
++	case <-time.After(2 * time.Second):
++		t.Fatal("actual idle network connection was not closed")
++	}
++	res, err = client.Get(server.URL)
++	require.NoError(t, err)
++	require.NoError(t, res.Body.Close())
++	require.EqualValues(t, 2, proxyCalls.Load(), "proxy callback retained after clone")
++}
++
++func TestPollTraceFreezesCompletedAttempt(t *testing.T) {
++	health := controlplane.NewPollHealth(nil)
++	trace, finish := newPollTrace(health)
++	trace.ConnectStart("tcp", "synthetic-address-not-for-health")
++	trace.WroteRequest(httptrace.WroteRequestInfo{})
++	finish()
++	trace.TLSHandshakeStart()
++	d := health.Snapshot(time.Now()).Details.(healthstate.PollingDetails)
++	require.Equal(t, "wait_response", d.TransportPhase)
++}
++
++func TestPollRecoveryCountsProductionPollerDeadline(t *testing.T) {
++	var stalled atomic.Bool
++	seen := make(chan string, 12)
++	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		seen <- r.RemoteAddr
++		if stalled.Load() {
++			<-r.Context().Done()
++			return
++		}
++		w.WriteHeader(204)
++	}))
++	server.EnableHTTP2 = true
++	server.StartTLS()
++	defer server.Close()
++	c, health := recoveryClient(t, server)
++	_, _, err := c.Poll(t.Context(), 1)
++	require.NoError(t, err)
++	first := <-seen
++	stalled.Store(true)
++	resets := func() uint64 {
++		return health.Snapshot(time.Now()).Details.(healthstate.PollingDetails).ConnectionPoolResets
++	}
++	attempt := func(parent context.Context) {
++		ctx, cancel := newPollAttemptContext(parent, 100*time.Millisecond)
++		defer cancel()
++		_, _, err := c.Poll(ctx, 1)
++		require.ErrorIs(t, err, context.DeadlineExceeded)
++		require.Equal(t, first, <-seen)
++	}
++	parent, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
++	attempt(parent)
++	cancel()
++	require.Zero(t, resets(), "real parent deadline must not recycle the pool")
++	attempt(t.Context())
++	require.EqualValues(t, 1, resets())
++	stalled.Store(false)
++	_, _, err = c.Poll(t.Context(), 1)
++	require.NoError(t, err)
++	require.NotEqual(t, first, <-seen, "production poller deadline must retire the real HTTP/2 pool")
++}
++
++type cancelAfterStartTransport struct {
++	base    http.RoundTripper
++	started chan struct{}
++}
++
++func (t cancelAfterStartTransport) RoundTrip(r *http.Request) (*http.Response, error) {
++	select {
++	case <-t.started:
++	default:
++		close(t.started)
++	}
++	return t.base.RoundTrip(r)
++}
+diff --git a/pkg/controlplane/internal/poll_trace.go b/pkg/controlplane/internal/poll_trace.go
+new file mode 100644
+index 0000000..574e11a
+--- /dev/null
++++ b/pkg/controlplane/internal/poll_trace.go
+@@ -0,0 +1,63 @@
++package internal
++
++import (
++	"crypto/tls"
++	"github.com/openai/tunnel-client/pkg/controlplane"
++	"net/http/httptrace"
++	"sync"
++	"time"
++)
++
++// Finish freezes this attempt so late callbacks cannot overwrite the next poll.
++func newPollTrace(health *controlplane.PollHealth) (*httptrace.ClientTrace, func()) {
++	var mu sync.Mutex
++	start := time.Now()
++	phase, protocol := "get_connection", ""
++	reused, finished := false, false
++	update := func(next string, connection *httptrace.GotConnInfo) {
++		mu.Lock()
++		defer mu.Unlock()
++		if finished {
++			return
++		}
++		phase = next
++		if connection != nil {
++			reused = connection.Reused
++			protocol = "http/1.1"
++			if conn, ok := connection.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok && conn.ConnectionState().NegotiatedProtocol == "h2" {
++				protocol = "h2"
++			}
++		}
++		health.TransportObservation(phase, reused, protocol, time.Since(start))
++	}
++	update(phase, nil)
++	trace := &httptrace.ClientTrace{
++		GetConn:      func(string) { update("get_connection", nil) },
++		DNSStart:     func(httptrace.DNSStartInfo) { update("dns", nil) },
++		ConnectStart: func(string, string) { update("connect", nil) },
++		ConnectDone: func(_, _ string, err error) {
++			if err == nil {
++				update("connected", nil)
++			}
++		},
++		TLSHandshakeStart: func() { update("tls_handshake", nil) },
++		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
++			if err == nil {
++				update("tls_ready", nil)
++			}
++		},
++		GotConn: func(info httptrace.GotConnInfo) { update("write_request", &info) },
++		WroteRequest: func(info httptrace.WroteRequestInfo) {
++			if info.Err == nil {
++				update("wait_response", nil)
++			}
++		},
++		GotFirstResponseByte: func() { update("read_response", nil) },
++	}
++	return trace, func() {
++		mu.Lock()
++		defer mu.Unlock()
++		finished = true
++		health.TransportObservation(phase, reused, protocol, time.Since(start))
++	}
++}
+diff --git a/pkg/controlplane/internal/poller.go b/pkg/controlplane/internal/poller.go
+index f5068e0..d89cb5e 100644
+--- a/pkg/controlplane/internal/poller.go
++++ b/pkg/controlplane/internal/poller.go
+@@ -148,7 +148,7 @@ func (p *poller) Run(ctx context.Context) {
+ 			PollTimeout:           p.pollTimeout,
+ 			PollDeadlineGuardrail: p.pollGuardrail,
+ 		}).PollDeadlineTimeoutOrDefault()
+-		pollCtx, cancel := context.WithTimeout(ctx, pollDeadline)
++		pollCtx, cancel := newPollAttemptContext(ctx, pollDeadline)
+ 		commands, tunnelServiceRequestID, err := p.fetcher.Poll(pollCtx, limit)
+ 		cancel()
+ 		p.metrics.pollLatency.Record(ctx, time.Since(pollStart).Seconds(), metric.WithAttributes(attribute.Bool("error", err != nil)))
+diff --git a/pkg/controlplane/internal/tunnel_service_client.go b/pkg/controlplane/internal/tunnel_service_client.go
+index ab568c3..2cfe55b 100644
+--- a/pkg/controlplane/internal/tunnel_service_client.go
++++ b/pkg/controlplane/internal/tunnel_service_client.go
+@@ -63,6 +63,7 @@ var errMissingConfig = errors.New("controlplane client: config is required")
+ // the control-plane HTTP API.
+ type TunnelServiceClient struct {
+ 	client                         *http.Client
++	pollPool                       *pollConnectionPool
+ 	secretClient                   *http.Client
+ 	pollEndpoint                   *url.URL
+ 	responseEndpoint               *url.URL
+@@ -134,7 +135,7 @@ func NewTunnelServiceClient(ctx context.Context, cfg *runtimeconfig.ControlPlane
+ 	pollDeadline := cfg.PollDeadlineTimeoutOrDefault()
+ 	usesProxy := controlPlaneUsesProxy(cfg, http.ProxyFromEnvironment, os.LookupEnv)
+ 
+-	transport, err := buildControlPlaneHTTPTransport(cfg, tlsBundle, logger, loggingCfg, meterProvider)
++	transport, pool, err := buildControlPlaneHTTPTransport(cfg, tlsBundle, logger, loggingCfg, meterProvider)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -145,6 +146,7 @@ func NewTunnelServiceClient(ctx context.Context, cfg *runtimeconfig.ControlPlane
+ 	tlsconfig.LogBundleUsage(logger, tlsBundle)
+ 
+ 	client := &TunnelServiceClient{
++		pollPool: pool,
+ 		client: &http.Client{
+ 			Timeout:   pollDeadline,
+ 			Transport: transport,
+@@ -517,7 +519,7 @@ func newSecretAPIStatusError(prefix string, resp *http.Response, now time.Time)
+ 	return statusErr
+ }
+ 
+-func buildControlPlaneHTTPTransport(cfg *runtimeconfig.ControlPlaneConfig, tlsBundle *tlsconfig.Bundle, logger *slog.Logger, loggingCfg *runtimeconfig.LoggingConfig, meterProvider otelmetric.MeterProvider) (http.RoundTripper, error) {
++func buildControlPlaneHTTPTransport(cfg *runtimeconfig.ControlPlaneConfig, tlsBundle *tlsconfig.Bundle, logger *slog.Logger, loggingCfg *runtimeconfig.LoggingConfig, meterProvider otelmetric.MeterProvider) (http.RoundTripper, *pollConnectionPool, error) {
+ 	return buildControlPlaneHTTPTransportWithLogging(
+ 		cfg,
+ 		tlsBundle,
+@@ -529,7 +531,7 @@ func buildControlPlaneHTTPTransport(cfg *runtimeconfig.ControlPlaneConfig, tlsBu
+ }
+ 
+ func buildSecretControlPlaneHTTPTransport(cfg *runtimeconfig.ControlPlaneConfig, tlsBundle *tlsconfig.Bundle, logger *slog.Logger, meterProvider otelmetric.MeterProvider) (http.RoundTripper, error) {
+-	return buildControlPlaneHTTPTransportWithLogging(
++	transport, _, err := buildControlPlaneHTTPTransportWithLogging(
+ 		cfg,
+ 		tlsBundle,
+ 		logger,
+@@ -537,9 +539,10 @@ func buildSecretControlPlaneHTTPTransport(cfg *runtimeconfig.ControlPlaneConfig,
+ 		meterProvider,
+ 		false,
+ 	)
++	return transport, err
+ }
+ 
+-func buildControlPlaneHTTPTransportWithLogging(cfg *runtimeconfig.ControlPlaneConfig, tlsBundle *tlsconfig.Bundle, logger *slog.Logger, loggingCfg *runtimeconfig.LoggingConfig, meterProvider otelmetric.MeterProvider, includeRawHTTPLogging bool) (http.RoundTripper, error) {
++func buildControlPlaneHTTPTransportWithLogging(cfg *runtimeconfig.ControlPlaneConfig, tlsBundle *tlsconfig.Bundle, logger *slog.Logger, loggingCfg *runtimeconfig.LoggingConfig, meterProvider otelmetric.MeterProvider, includeRawHTTPLogging bool) (http.RoundTripper, *pollConnectionPool, error) {
+ 	// Order matters (outermost to innermost):
+ 	//   1. Control-plane round tripper applies auth headers before anything else.
+ 	//   2. Optional logging wraps otel instrumentation so dumps include the final headers.
+@@ -548,19 +551,19 @@ func buildControlPlaneHTTPTransportWithLogging(cfg *runtimeconfig.ControlPlaneCo
+ 	//      middleware cannot delay the timestamp by consuming the response body.
+ 	extraHeaders, err := runtimeconfig.NormalizeExtraHeaders("controlplane client extra headers", cfg.ExtraHeaders)
+ 	if err != nil {
+-		return nil, fmt.Errorf("controlplane client: %w", err)
++		return nil, nil, fmt.Errorf("controlplane client: %w", err)
+ 	}
+ 	base, err := tctransport.CloneDefaultWithBundle(tlsBundle)
+ 	if err != nil {
+-		return nil, fmt.Errorf("controlplane client: %w", err)
++		return nil, nil, fmt.Errorf("controlplane client: %w", err)
+ 	}
+ 	base, err = tctransport.ApplyClientCertificate(base, cfg.ClientCertificate)
+ 	if err != nil {
+-		return nil, fmt.Errorf("controlplane client: %w", err)
++		return nil, nil, fmt.Errorf("controlplane client: %w", err)
+ 	}
+ 	base, err = tctransport.ApplyProxy(base, cfg.HTTPProxy)
+ 	if err != nil {
+-		return nil, fmt.Errorf("controlplane client: %w", err)
++		return nil, nil, fmt.Errorf("controlplane client: %w", err)
+ 	}
+ 	socketPath := cfg.UnixSocketPath
+ 	if socketPath == "" {
+@@ -568,7 +571,14 @@ func buildControlPlaneHTTPTransportWithLogging(cfg *runtimeconfig.ControlPlaneCo
+ 	}
+ 	base, err = tctransport.ApplyUnixSocketPath(base, socketPath)
+ 	if err != nil {
+-		return nil, fmt.Errorf("controlplane client: %w", err)
++		return nil, nil, fmt.Errorf("controlplane client: %w", err)
++	}
++	var pool *pollConnectionPool
++	if includeRawHTTPLogging {
++		if transport, ok := base.(*http.Transport); ok {
++			pool = newPollConnectionPool(transport)
++			base = pool
++		}
+ 	}
+ 	base = newResponseReceiptRoundTripper(base)
+ 	base = tcmetrics.WithHTTPClientMetricAttributes(base)
+@@ -597,7 +607,7 @@ func buildControlPlaneHTTPTransportWithLogging(cfg *runtimeconfig.ControlPlaneCo
+ 		extraHeaders,
+ 		logger,
+ 		cfg.TraceContextEnabled,
+-	), nil
++	), pool, nil
+ }
+ 
+ // PostResponse acknowledges the provided request with the JSON-RPC response.
+@@ -840,7 +850,7 @@ func canonicalResponseHeaderName(normalizedName string) (string, bool) {
+ }
+ 
+ // Poll requests up to limit commands from the control plane.
+-func (c *TunnelServiceClient) Poll(ctx context.Context, limit int) ([]controlplane.PolledCommand, types.TunnelServiceRequestID, error) {
++func (c *TunnelServiceClient) Poll(ctx context.Context, limit int) (commands []controlplane.PolledCommand, requestID types.TunnelServiceRequestID, returnErr error) {
+ 	if limit <= 0 {
+ 		return nil, "", nil
+ 	}
+@@ -852,9 +862,21 @@ func (c *TunnelServiceClient) Poll(ctx context.Context, limit int) ([]controlpla
+ 	// Keep any learned proxy-specific deadline scoped to polls. The shared HTTP
+ 	// client also serves metadata and response calls, which retain their
+ 	// configured timeout.
++	recoveryParent := ctx
++	if attempt, ok := ctx.(pollAttemptContext); ok {
++		recoveryParent = attempt.parent
++	}
+ 	pollTimeout := c.effectivePollTimeout()
+ 	pollCtx, cancel := context.WithTimeout(ctx, c.pollDeadlineFor(pollTimeout))
+ 	defer cancel()
++	defer func() {
++		// Only our expired poll deadline counts, never a parent stop or a
++		// successful empty long poll. Response sends are not replayed.
++		deadline := errors.Is(returnErr, context.DeadlineExceeded) && recoveryParent.Err() == nil && errors.Is(pollCtx.Err(), context.DeadlineExceeded)
++		if c.pollPool != nil && c.pollPool.observePoll(deadline) {
++			c.pollHealth.ConnectionPoolReset()
++		}
++	}()
+ 
+ 	req, err := http.NewRequestWithContext(pollCtx, http.MethodGet, c.pollEndpoint.String(), nil)
+ 	if err != nil {
+@@ -882,6 +904,9 @@ func (c *TunnelServiceClient) Poll(ctx context.Context, limit int) ([]controlpla
+ 	}
+ 	req.URL.RawQuery = query.Encode()
+ 	receipt := newResponseReceiptRecorder(c.nowTime)
++	trace, finishTrace := newPollTrace(c.pollHealth)
++	defer finishTrace()
++	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+ 	var pollWrittenAt atomic.Pointer[time.Time]
+ 	req = req.WithContext(httptrace.WithClientTrace(
+ 		contextWithResponseReceiptRecorder(req.Context(), receipt),
+@@ -899,6 +924,8 @@ func (c *TunnelServiceClient) Poll(ctx context.Context, limit int) ([]controlpla
+ 	// Keep redirects scoped to polling and reject them before the auth transport
+ 	// can attach credentials or a routing token to a different destination.
+ 	pollClient := *c.client
++	// The explicit poll context owns the deadline, avoiding competing timers.
++	pollClient.Timeout = 0
+ 	pollClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+ 	resp, err := pollClient.Do(req)
+ 	if err != nil {
+diff --git a/pkg/controlplane/internal/tunnel_service_client_test.go b/pkg/controlplane/internal/tunnel_service_client_test.go
+index bbe59d1..6bc3a47 100644
+--- a/pkg/controlplane/internal/tunnel_service_client_test.go
++++ b/pkg/controlplane/internal/tunnel_service_client_test.go
+@@ -3215,7 +3215,7 @@ func TestControlPlaneRichHeaderPrivacySuppressesBothRawDirections(t *testing.T)
+ 			}))
+ 			var logs bytes.Buffer
+ 			logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+-			transport, err := buildControlPlaneHTTPTransport(&config.ControlPlaneConfig{
++			transport, _, err := buildControlPlaneHTTPTransport(&config.ControlPlaneConfig{
+ 				BaseURL: mustParseURL(t, server.URL), TunnelID: types.TunnelID("cli-tunnel"), APIKey: "runtime-key",
+ 				SuppressRawHTTPLogging: suppress,
+ 			}, nil, logger, &config.LoggingConfig{HTTPRawUnsafe: true}, testMeterProvider)
+diff --git a/pkg/healthstate/operations.go b/pkg/healthstate/operations.go
+index a2b48c1..23d1008 100644
+--- a/pkg/healthstate/operations.go
++++ b/pkg/healthstate/operations.go
+@@ -4,6 +4,11 @@ import "time"
+ 
+ // PollingDetails describes observations of the existing polling loop.
+ type PollingDetails struct {
++	TransportPhase        string     `json:"transport_phase,omitempty"`
++	TransportReused       bool       `json:"transport_reused"`
++	TransportProtocol     string     `json:"transport_protocol,omitempty"`
++	TransportElapsedMS    int64      `json:"transport_elapsed_ms"`
++	ConnectionPoolResets  uint64     `json:"connection_pool_resets"`
+ 	LastAttempt           *time.Time `json:"last_attempt,omitempty"`
+ 	LastSuccess           *time.Time `json:"last_success,omitempty"`
+ 	LastError             *time.Time `json:"last_error,omitempty"`

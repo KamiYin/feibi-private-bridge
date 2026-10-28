@@ -21,7 +21,7 @@ const fail=code=>{throw Object.assign(new Error(code),{code});};
 const obj=x=>x&&typeof x==='object'&&!Array.isArray(x);
 const exact=(x,keys)=>obj(x)&&Object.keys(x).sort().join(',')===[...keys].sort().join(',');
 export const validOrigin=x=>typeof x==='string'&&x.length<=261&&/^https:\/\/(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*(?:openai\.com|chatgpt\.com)$/.test(x);
-export const EXPECTED_BINARY_SHA256='30e10e36956085c6c73f88e30942d1b96c2645f1ad6cea3b7697cb2de5ce5c48';
+export const EXPECTED_BINARY_SHA256='e607591deed958e2e324a9246b2683c727405bcbe69164d45cc67137db5d4e5f';
 export function preflight({root=ROOT,platform=process.platform,arch=process.arch,node=process.versions.node,read=fs.readFileSync,stat=fs.lstatSync}={}){
   const issues=[];let binaryHash=null;
   if(platform!=='win32'||arch!=='x64')issues.push('WINDOWS_X64_REQUIRED');
@@ -31,16 +31,18 @@ export function preflight({root=ROOT,platform=process.platform,arch=process.arch
     const expected=EXPECTED_BINARY_SHA256;
     binaryHash=crypto.createHash('sha256').update(read(p)).digest('hex');if(binaryHash!==expected)issues.push('REVIEWED_BINARY_HASH_MISMATCH');
   }catch{issues.push('REVIEWED_BINARY_MISSING');}
-  return{mode:'windows_preflight_only',can_prepare_run:issues.length===0,issues,binary_sha256:binaryHash,credential_read:false,launched:false,qr_started:false,maximum_seconds:25200,windows_execution_verified:false};
+  return{mode:'windows_preflight_only',can_prepare_run:issues.length===0,issues,binary_sha256:binaryHash,credential_read:false,launched:false,qr_started:false,maximum_seconds:43200,windows_execution_verified:false};
 }
 export function validateBootstrap(x,{platform=process.platform}={}){
   const fields=['action','runtime_key','expected_suffix','tunnel_id','nonce','seconds','directory','routing_snapshot','acl_verified','tunnel_approved','qr_approved','text_transfer_approved','reply_approved'];
+  if(obj(x)&&x.persistent===true)fields.push('persistent','state_directory');
   if(obj(x)&&Object.hasOwn(x,'deadline_utc'))fields.push('deadline_utc');
-  if(!exact(x,fields)||x.action!=='bootstrap'||!KEY.test(x.runtime_key??'')||!TUNNEL.test(x.tunnel_id??'')||!NONCE.test(x.nonce??'')||!Number.isInteger(x.seconds)||x.seconds<1||x.seconds>25200)fail('BOOTSTRAP_REJECTED');
+  if(!exact(x,fields)||x.action!=='bootstrap'||!KEY.test(x.runtime_key??'')||!TUNNEL.test(x.tunnel_id??'')||!NONCE.test(x.nonce??'')||!Number.isInteger(x.seconds)||x.seconds<1||(x.persistent!==true&&x.seconds>43200))fail('BOOTSTRAP_REJECTED');
   if(Object.hasOwn(x,'deadline_utc')&&(typeof x.deadline_utc!=='string'||!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(x.deadline_utc)||!Number.isFinite(Date.parse(x.deadline_utc))||new Date(Date.parse(x.deadline_utc)).toISOString()!==x.deadline_utc))fail('BOOTSTRAP_REJECTED');
   if(x.expected_suffix!==''&&(!/^[A-Za-z0-9_-]{4}$/.test(x.expected_suffix)||!x.runtime_key.endsWith(x.expected_suffix)))fail('KEY_PASTE_CHECK_FAILED');
   for(const k of ['acl_verified','tunnel_approved','qr_approved','text_transfer_approved','reply_approved'])if(x[k]!==true)fail('ACTION_APPROVAL_REQUIRED');
   if(typeof x.directory!=='string'||!path.isAbsolute(x.directory)||!/^feibi-private-[0-9a-f]{32}$/.test(path.basename(x.directory)))fail('PRIVATE_DIRECTORY_REQUIRED');
+  if(x.persistent===true&&(!path.isAbsolute(x.state_directory??'')||!x.deadline_utc))fail('PERSISTENT_CONFIGURATION_REQUIRED');
   return{...x,routing:validateWindowsRouting({snapshot:x.routing_snapshot,existingRouteApproved:true,platform})};
 }
 export function parseControl(line){
@@ -59,6 +61,7 @@ export function childEnvironments(config,keys,deadline,source={}){
   Object.assign(common,{HOME:config.directory,USERPROFILE:config.directory,APPDATA:config.directory,LOCALAPPDATA:config.directory,TEMP:config.directory,TMP:config.directory});
   const node={...common,SYNTHETIC_MCP_SECRET:keys.mcp,SYNTHETIC_OPERATOR_SECRET:keys.operator,HTTPS_PROXY:config.routing.proxyUrl,
     WEIXIN_PRIVATE_PILOT_APPROVED:'yes',WEIXIN_QR_APPROVED:'yes',WEIXIN_OWNER_TEXT_TRANSFER_APPROVED:'yes',WEIXIN_OWNER_TEXT_REPLY_APPROVED:'yes',WEIXIN_TUNNEL_ISOLATION:'single-user',WEIXIN_PORT:'8767',WEIXIN_DEADLINE_UNIX_MS:String(deadline),WEIXIN_OWNER_NONCE:config.nonce};
+  if(config.persistent){node.WEIXIN_PERSISTENT='yes';node.WEIXIN_STATE_DIRECTORY=config.state_directory;}
   const runtime={...common,BOUNDED_TUNNEL_RUNTIME_SECRET:config.runtime_key,SYNTHETIC_MCP_SECRET:keys.mcp};
   runtime.BOUNDED_EXISTING_HTTPS_PROXY=config.routing.proxyUrl;
   return{node,runtime,renderer:common};
@@ -75,15 +78,15 @@ export function runtimeArgs(config){
   return a;
 }
 export function safeSession(x){
-  if(!obj(x)||!PHASES.has(x.phase)||x.storage!=='memory_only')fail('LOCAL_RESPONSE_REJECTED');
-  const out={phase:x.phase,storage:'memory_only'};for(const k of ['authenticated','owner_bound','personal_message_access_started']){if(typeof x[k]!=='boolean')fail('LOCAL_RESPONSE_REJECTED');out[k]=x[k];}
+  if(!obj(x)||!PHASES.has(x.phase)||!['memory_only','dpapi_current_user'].includes(x.storage))fail('LOCAL_RESPONSE_REJECTED');
+  const out={phase:x.phase,storage:x.storage};for(const k of ['authenticated','owner_bound','personal_message_access_started']){if(typeof x[k]!=='boolean')fail('LOCAL_RESPONSE_REJECTED');out[k]=x[k];}
   if(!Number.isInteger(x.last_http_status)||x.last_http_status!==0&&(x.last_http_status<100||x.last_http_status>599))fail('LOCAL_RESPONSE_REJECTED');out.last_http_status=x.last_http_status;
   if(x.pending_api_origin!==null&&x.pending_api_origin!=='https://ilinkai.weixin.qq.com')out.pending_api_origin_review_required=true;
   return out;
 }
 export function safeStatus(x){
   if(!obj(x)||!obj(x.mcp))fail('LOCAL_RESPONSE_REJECTED');const v=x.mcp;
-  const mcp={service:'feibi-private-weixin-candidate',protocol_version:'2026-07-28',synthetic_only:false,memory_only:true,same_dot_verified:false};
+  const mcp={service:'feibi-private-weixin-candidate',protocol_version:'2026-07-28',synthetic_only:false,memory_only:v.memory_only,same_dot_verified:false};
   for(const[k,w]of Object.entries(mcp))if(v[k]!==w)fail('LOCAL_RESPONSE_REJECTED');
   for(const k of ['personal_channel_connected','owner_confirmation_pending','callbacks_enabled']){if(typeof v[k]!=='boolean')fail('LOCAL_RESPONSE_REJECTED');mcp[k]=v[k];}
   for(const k of ['active_subscriptions','queued_events','accepted_events']){if(!Number.isInteger(v[k])||v[k]<0||v[k]>10000)fail('LOCAL_RESPONSE_REJECTED');mcp[k]=v[k];}
@@ -102,7 +105,15 @@ export function safeHealth(x){
   if(['ok','degraded','unknown','disabled'].includes(x.status))out.status=x.status;
   if(['polling','waiting','idle','backoff','retrying','starting','stopped'].includes(x.state))out.state=x.state;
   if(typeof x.reason_code==='string'&&/^http_[1-5][0-9]{2}$/.test(x.reason_code))out.reason_code=x.reason_code;
-  if(obj(x.details)){out.details={};for(const k of ['http_status','consecutive_failures','attempts','accepted','poll_successes'])if(Number.isSafeInteger(x.details[k])&&x.details[k]>=0)out.details[k]=x.details[k];for(const k of ['last_success','last_success_at'])if(typeof x.details[k]==='string'&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(x.details[k]))out.details[k]=x.details[k];}
+  if(obj(x.details)){out.details={};for(const k of ['http_status','consecutive_failures','attempts','accepted','poll_successes','transport_elapsed_ms','connection_pool_resets'])if(Number.isSafeInteger(x.details[k])&&x.details[k]>=0)out.details[k]=x.details[k];for(const k of ['last_success','last_success_at','last_attempt','last_error'])if(typeof x.details[k]==='string'&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(x.details[k]))out.details[k]=x.details[k];}
+  if(obj(x.details)){
+    const d=x.details;
+    if(['get_connection','dns','connect','connected','tls_handshake','tls_ready','write_request','wait_response','read_response'].includes(d.transport_phase))out.details.transport_phase=d.transport_phase;
+    if(['http/1.1','h2'].includes(d.transport_protocol))out.details.transport_protocol=d.transport_protocol;
+    if(typeof d.transport_reused==='boolean')out.details.transport_reused=d.transport_reused;
+    if(Number.isFinite(d.current_poll_age_seconds)&&d.current_poll_age_seconds>=0)out.details.current_poll_age_seconds=d.current_poll_age_seconds;
+    if(['timeout','canceled','network_error','request_error'].includes(d.failure_category))out.details.failure_category=d.failure_category;
+  }
   return out;
 }
 export function healthStop(x){const n=x?.details?.http_status??Number(x?.reason_code?.slice(5));return[401,403].includes(n)?'AUTHORIZATION_STOP':[402,429].includes(n)?'PAYMENT_OR_QUOTA_STOP':null;}
@@ -126,19 +137,19 @@ export class Supervisor{
   }
   async start(input){
     if(this.stopped)fail('SUPERVISOR_STOPPED');this.config=validateBootstrap(input);input.runtime_key='';
-    const began=this.now();this.deadline=Math.min(began+this.config.seconds*1000,this.config.deadline_utc===undefined?Infinity:Date.parse(this.config.deadline_utc));
+    const began=this.now();this.deadline=Math.min(this.config.persistent?Infinity:began+this.config.seconds*1000,this.config.deadline_utc===undefined?Infinity:Date.parse(this.config.deadline_utc));
     if(this.deadline<=began)fail('SESSION_STOPPED_OR_EXPIRED');
     this.keys={mcp:crypto.randomBytes(32).toString('base64'),operator:crypto.randomBytes(32).toString('base64')};
     const s=this.fs.lstatSync(this.config.directory);if(!s.isDirectory()||s.isSymbolicLink()||this.fs.readdirSync(this.config.directory).length)fail('PRIVATE_EMPTY_DIRECTORY_REQUIRED');
-    this.timer=setTimeout(()=>void this.stop('TIME_LIMIT_REACHED'),Math.max(1,this.deadline-this.now()));
+    this.timer=this.config.persistent?setInterval(()=>{if(this.now()>=this.deadline)void this.stop('TIME_LIMIT_REACHED');},1000):setTimeout(()=>void this.stop('TIME_LIMIT_REACHED'),Math.max(1,this.deadline-this.now()));
     const env=childEnvironments(this.config,this.keys,this.deadline,this.source);
     try{
       if(this.now()>=this.deadline)fail('SESSION_STOPPED_OR_EXPIRED');
       this.node=this.child(process.execPath,['--use-system-ca',path.join(this.root,'weixin-candidate/run.mjs'),'--serve'],env.node);Object.keys(env.node).forEach(k=>delete env.node[k]);
-      let ready=false;const startup=Math.min(this.deadline,this.now()+15000);while(!this.stopped&&this.now()<startup){try{const v=safeStatus(await this.post('/local/status',{},1000));if(v.session.phase==='idle'&&!v.mcp.callbacks_enabled&&!v.mcp.personal_channel_connected){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,100));}
+      let ready=false;const startup=Math.min(this.deadline,this.now()+15000);while(!this.stopped&&this.now()<startup){try{const v=safeStatus(await this.post('/local/status',{},1000));if(this.config.persistent || (v.session.phase==='idle'&&!v.mcp.callbacks_enabled&&!v.mcp.personal_channel_connected)){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,100));}
       if(!ready||this.stopped||this.now()>=this.deadline)fail('LOCAL_MCP_START_TIMEOUT');
       this.runtime=this.child(path.join(this.root,'windows-pilot/bin/tunnel-client-runtime-origin-guard.exe'),runtimeArgs(this.config),env.runtime);Object.keys(env.runtime).forEach(k=>delete env.runtime[k]);this.config.runtime_key='';
-      this.publish('bounded_windows_started',{maximum_seconds:this.config.seconds,deadline_utc:new Date(this.deadline).toISOString(),local_mcp_authenticated:true,qr_started:false,memory_only:true});
+      this.publish('bounded_windows_started',{maximum_seconds:this.config.seconds,deadline_utc:new Date(this.deadline).toISOString(),local_mcp_authenticated:true,qr_started:false,memory_only:!this.config.persistent});
       this.healthTimer=setInterval(()=>{if(!this.healthBusy&&!this.stopped){this.healthBusy=true;void this.health().finally(()=>{this.healthBusy=false;});}},5000);
     }catch{await this.stop('STARTUP_FAILED');}finally{this.config.runtime_key='';for(const v of Object.values(env))for(const k of Object.keys(v))delete v[k];}
     return this.done;
@@ -158,7 +169,7 @@ export class Supervisor{
       if(['pending_owner_confirmation','qr_expired','stopped'].includes(result.phase))this.removeQr();
       else if(['wait','scaned'].includes(result.phase))this.scheduleQrPoll();
     }
-    else if(x.action==='confirm_owner'){const v=await this.post('/local/confirm-owner',{nonce:x.nonce,user_confirmed_scan:true},1000);if(!exact(v,['connected','owner_bound','storage'])||v.connected!==true||v.owner_bound!==true||v.storage!=='memory_only')fail('LOCAL_RESPONSE_REJECTED');result=v;}
+    else if(x.action==='confirm_owner'){const v=await this.post('/local/confirm-owner',{nonce:x.nonce,user_confirmed_scan:true},1000);if(!exact(v,['connected','owner_bound','storage'])||v.connected!==true||v.owner_bound!==true||!['memory_only','dpapi_current_user'].includes(v.storage))fail('LOCAL_RESPONSE_REJECTED');result=v;}
     else if(x.action==='approve_callback'){const v=await this.post('/local/approve-callback',{origin:x.origin},1000);if(v.approved!==true||v.origin!==x.origin||v.callbacks_enabled!==true)fail('LOCAL_RESPONSE_REJECTED');result={approved:true,origin:x.origin,callbacks_enabled:true};}
     else if(x.action==='qr_start'){await this.qr();return;}
     if(!this.stopped&&this.now()<this.deadline)this.publish('operator_result',{action:x.action,result});
@@ -186,7 +197,7 @@ export class Supervisor{
   removeQr(){clearTimeout(this.qrTimer);clearTimeout(this.qrPollTimer);if(this.qrActive){this.qrActive=false;this.publish('qr_closed',{reason:'QR_REMOVED'});}}
   async stop(reason){if(this.stopped)return this.done;this.stopped=true;clearTimeout(this.timer);clearInterval(this.healthTimer);this.abort.abort();
     let exited=true;for(const p of [...this.children].reverse()){if(p.exitCode!==null||p.signalCode!==null)continue;let timer;const done=new Promise(r=>p.once('exit',()=>r(true)));try{p.kill();}catch{}const ok=await Promise.race([done,new Promise(r=>{timer=setTimeout(()=>r(false),5000);})]);clearTimeout(timer);if(!ok)exited=false;}
-    this.removeQr();let removed=false;if(this.config?.directory){try{const profiles=path.join(this.config.directory,'empty-profiles');if(this.fs.existsSync(profiles))this.fs.rmdirSync(profiles);this.fs.rmdirSync(this.config.directory);}catch{}removed=!this.fs.existsSync(this.config.directory);}
+    this.removeQr();let removed=false;if(this.config?.directory){try{const profiles=path.join(this.config.directory,'empty-profiles');if(this.fs.existsSync(profiles))this.fs.rmdirSync(profiles);for(const rel of ['AppData/Roaming','AppData']){const extra=path.join(this.config.directory,rel);if(this.fs.existsSync(extra)&&!this.fs.lstatSync(extra).isSymbolicLink())this.fs.rmdirSync(extra);}this.fs.rmdirSync(this.config.directory);}catch{}removed=!this.fs.existsSync(this.config.directory);}
     if(this.keys){this.keys.mcp='';this.keys.operator='';}if(this.config)this.config.runtime_key='';
     this.publish('bounded_windows_stopped',{reason:exited&&removed?reason:'CLEANUP_UNCONFIRMED',children_exited:exited,temporary_files_removed:removed,account_authorization_revoked:false});this.resolveDone();return this.done;
   }
