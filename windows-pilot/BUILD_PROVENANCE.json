@@ -1,0 +1,17 @@
+{
+  "target": "windows/amd64",
+  "format": "PE32+",
+  "upstream": "https://github.com/openai/tunnel-client",
+  "source_version": "v0.0.18",
+  "source_commit": "274a5588414819f063d27100a4fb1096aae3830f",
+  "local_patch": "origin-guard.patch",
+  "go_version": "go1.27.3",
+  "offline_build": true,
+  "GOPROXY": "off",
+  "GOTOOLCHAIN": "local",
+  "CGO_ENABLED": "0",
+  "binary_sha256": "30e10e36956085c6c73f88e30942d1b96c2645f1ad6cea3b7697cb2de5ce5c48",
+  "windows_execution_tested": false,
+  "dependency_license_count": 74,
+  "missing_dependency_license_roots": []
+}

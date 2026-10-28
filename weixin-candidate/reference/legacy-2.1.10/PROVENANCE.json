@@ -1,0 +1,9 @@
+{
+  "package": "@tencent-weixin/openclaw-weixin",
+  "version": "2.1.10",
+  "registry_metadata_url": "https://registry.npmjs.org/@tencent-weixin%2fopenclaw-weixin/2.1.10",
+  "tarball_url": "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.1.10.tgz",
+  "npm_integrity": "sha512-cEG6Iw5g2qqlA+8/TcmV+E8aFUEX0ruxF0+a5LgVy5wv56/qP07KoapfRa7YTRPzhRW5UDaz6zsZQArt/4ZNnA==",
+  "tarball_sha256": "1dabe30f5ac04914ecae8238396de6cb13ab65b4c425bed1bc90257791bfe4d1",
+  "installation_or_scripts_run": false
+}

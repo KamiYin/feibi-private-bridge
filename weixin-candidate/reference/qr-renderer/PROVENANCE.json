@@ -1,0 +1,9 @@
+{
+  "package": "qrcode-terminal",
+  "version": "0.12.0",
+  "integrity": "sha512-EXtzRZmC+YGmGlDFbXKxQiMZNwCLEO6BANKXG4iCtSIM0yqc/pappSx3RIKr4r0uh5JsBckOXeKrB3Iz7mdQpQ==",
+  "sha256": "3a6260c4e0d80bd527a3f930e90ea2348c03646621f25aa0bd960ee205a0a706",
+  "source": "https://registry.npmjs.org/qrcode-terminal/-/qrcode-terminal-0.12.0.tgz",
+  "installed": false,
+  "scripts_executed": false
+}

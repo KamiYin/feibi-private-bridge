@@ -1,0 +1,436 @@
+--- a/pkg/controlplane/internal/origin_guard_test.go
++++ b/pkg/controlplane/internal/origin_guard_test.go
+@@ -0,0 +1,219 @@
++package internal
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++
++	"github.com/openai/tunnel-client/pkg/runtimeconfig"
++	"github.com/openai/tunnel-client/pkg/tunnelctx"
++	"github.com/openai/tunnel-client/pkg/types"
++	metricnoop "go.opentelemetry.io/otel/metric/noop"
++)
++
++func TestOriginGuardRejectsBeforeCredentialsOrTransport(t *testing.T) {
++	t.Parallel()
++	for _, target := range []string{"https://other.invalid/v1", "http://approved.invalid/v1", "https://approved.invalid:444/v1", "https://user:pass@approved.invalid/v1", "https://approved.invalid.evil/v1"} {
++		t.Run(target, func(t *testing.T) {
++			t.Parallel()
++			tokens, headers, calls := 0, 0, 0
++			rt := newControlPlaneRoundTripper(roundTripperFunc(func(*http.Request) (*http.Response, error) { calls++; return nil, nil }), &url.URL{Scheme: "https", Host: "approved.invalid"}, func(context.Context) (string, error) { tokens++; return "synthetic-token", nil }, "ua", "", func() (string, error) { headers++; return "synthetic-info", nil }, nil, newDiscardLogger())
++			req, err := http.NewRequest(http.MethodGet, target, nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			_, err = rt.RoundTrip(req)
++			if err == nil || err.Error() != "controlplane client: request origin not approved" || tokens != 0 || headers != 0 || calls != 0 || req.Header.Get("Authorization") != "" {
++				t.Fatal("unapproved origin reached credential/header/transport work")
++			}
++		})
++	}
++}
++
++func TestOriginGuardCapturesOriginAndChecksHostOverride(t *testing.T) {
++	t.Parallel()
++	original := &url.URL{Scheme: "https", Host: "approved.invalid"}
++	calls := 0
++	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
++		calls++
++		if req.Header.Get("Authorization") != "Bearer synthetic-token" {
++			t.Fatal("missing synthetic auth")
++		}
++		return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
++	}), original, staticBearerToken("synthetic-token"), "ua", "", nil, nil, newDiscardLogger())
++	original.Host = "mutated.invalid"
++	for _, host := range []string{"other.invalid", "approved.invalid:444", "user@approved.invalid"} {
++		req, _ := http.NewRequest("GET", "https://approved.invalid/test", nil)
++		req.Host = host
++		if _, err := rt.RoundTrip(req); err == nil {
++			t.Fatal("invalid Host accepted")
++		}
++	}
++	req, _ := http.NewRequest("GET", "https://APPROVED.invalid:443/test", nil)
++	if _, err := rt.RoundTrip(req); err != nil {
++		t.Fatal(err)
++	}
++	if calls != 1 {
++		t.Fatal("wrong transport call count")
++	}
++	req, _ = http.NewRequest("GET", "https://mutated.invalid/test", nil)
++	if _, err := rt.RoundTrip(req); err == nil {
++		t.Fatal("mutable config expanded origin")
++	}
++}
++
++func TestOriginGuardInvalidOriginAndMalformedRequestsFailClosed(t *testing.T) {
++	t.Parallel()
++	for _, origin := range []*url.URL{nil, {Scheme: "ftp", Host: "approved.invalid"}, {Scheme: "https", Host: "approved.invalid:bad"}, {Scheme: "https", Host: "approved.invalid/path"}, {Scheme: "https", Host: "user@approved.invalid"}} {
++		rt := newControlPlaneRoundTripper(roundTripperFunc(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected transport"); return nil, nil }), origin, func(context.Context) (string, error) { t.Fatal("unexpected credential read"); return "", nil }, "ua", "", nil, nil, newDiscardLogger())
++		req, _ := http.NewRequest("GET", "https://approved.invalid/test", nil)
++		if _, err := rt.RoundTrip(req); err == nil {
++			t.Fatal("invalid origin accepted")
++		}
++		if _, err := rt.RoundTrip(nil); err == nil {
++			t.Fatal("nil request accepted")
++		}
++	}
++}
++
++func TestOriginGuardEveryClientRejectsRedirectsWithoutFollowing(t *testing.T) {
++	t.Parallel()
++	for _, useProvider := range []bool{false, true} {
++		for _, status := range []int{301, 302, 303, 307, 308} {
++			cfg := &runtimeconfig.ControlPlaneConfig{BaseURL: &url.URL{Scheme: "https", Host: "approved.invalid"}, TunnelID: "tunnel_synthetic", APIKey: "synthetic-token"}
++			if useProvider {
++				cfg.TokenProvider = staticBearerToken("synthetic-token")
++			}
++			client, err := NewTunnelServiceClient(context.Background(), cfg, nil, newDiscardLogger(), &runtimeconfig.LoggingConfig{}, metricnoop.NewMeterProvider())
++			if err != nil {
++				t.Fatal(err)
++			}
++			for _, c := range []*http.Client{client.client, client.secretClient} {
++				auth, ok := c.Transport.(*controlPlaneRoundTripper)
++				if !ok {
++					t.Fatal("production transport missing origin guard")
++				}
++				calls := 0
++				auth.base = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
++					calls++
++					return &http.Response{StatusCode: status, Header: http.Header{"Location": []string{"https://other.invalid/never-contact"}}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
++				})
++				req, _ := http.NewRequest("GET", "https://approved.invalid/v1/test", nil)
++				response, err := c.Do(req)
++				if err != nil {
++					t.Fatal(err)
++				}
++				response.Body.Close()
++				if response.StatusCode != status || calls != 1 {
++					t.Fatal("redirect followed")
++				}
++				if c.CheckRedirect == nil || c.CheckRedirect(req, nil) != http.ErrUseLastResponse {
++					t.Fatal("redirect policy absent")
++				}
++			}
++		}
++	}
++}
++
++func TestOriginGuardMalformedRequestNeverReadsCredentials(t *testing.T) {
++	t.Parallel()
++	called := 0
++	rt := newControlPlaneRoundTripper(roundTripperFunc(func(*http.Request) (*http.Response, error) { called++; return nil, nil }), &url.URL{Scheme: "https", Host: "approved.invalid"}, func(context.Context) (string, error) { called++; return "synthetic", nil }, "ua", "", nil, nil, newDiscardLogger())
++	requests := []*http.Request{nil, {}, {URL: &url.URL{Scheme: "https", Host: "approved.invalid:bad"}}, {URL: &url.URL{Scheme: "https", Host: "approved.invalid/path"}}, {URL: &url.URL{Scheme: "https", Host: "approved.invalid", Opaque: "//other.invalid"}}, {URL: &url.URL{Scheme: "https", Host: "approved.invalid", User: url.UserPassword("user", "synthetic")}}}
++	for _, req := range requests {
++		if _, err := rt.RoundTrip(req); err == nil {
++			t.Fatal("malformed request accepted")
++		}
++	}
++	if called != 0 {
++		t.Fatal("malformed request reached token or transport")
++	}
++}
++
++func TestOriginGuardActualAPIMethodsNeverFollowSameOrCrossOriginRedirects(t *testing.T) {
++	t.Parallel()
++	for _, location := range []string{"https://approved.invalid/elsewhere", "https://other.invalid/never-contact"} {
++		for _, method := range []string{"metadata", "poll", "response", "managed-secret"} {
++			cfg := &runtimeconfig.ControlPlaneConfig{BaseURL: &url.URL{Scheme: "https", Host: "approved.invalid"}, TunnelID: "tunnel_synthetic", APIKey: "synthetic-token"}
++			client, err := NewTunnelServiceClient(context.Background(), cfg, nil, newDiscardLogger(), &runtimeconfig.LoggingConfig{}, metricnoop.NewMeterProvider())
++			if err != nil {
++				t.Fatal(err)
++			}
++			calls := 0
++			fake := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
++				calls++
++				return &http.Response{StatusCode: 307, Header: http.Header{"Location": []string{location}}, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
++			})
++			client.client.Transport.(*controlPlaneRoundTripper).base = fake
++			client.secretClient.Transport.(*controlPlaneRoundTripper).base = fake
++			client.responseRetryAttempts = 1
++			client.managedCloudflareRetryAttempts = 1
++			ctx := tunnelctx.ContextWithChannel(tunnelctx.ContextWithShardToken(context.Background(), "synthetic-shard"), types.DefaultChannel)
++			switch method {
++			case "metadata":
++				_, err = client.FetchTunnelMetadata(ctx)
++			case "poll":
++				_, _, err = client.Poll(ctx, 1)
++			case "response":
++				_, err = client.PostResponse(ctx, "synthetic-request", types.NewNotificationAck(types.DefaultChannel, http.StatusOK, http.Header{}))
++			case "managed-secret":
++				_, err = client.FetchManagedCloudflareTunnel(ctx)
++			}
++			if err == nil || calls != 1 {
++				t.Fatalf("method %s did not reject one redirect", method)
++			}
++		}
++	}
++}
++
++func TestOriginGuardEnvReferenceResolvesBeforeActualAPIRequests(t *testing.T) {
++	t.Parallel()
++	const expected = "synthetic-runtime-value-not-a-real-key"
++	env := map[string]string{"BOUNDED_TUNNEL_RUNTIME_SECRET": expected}
++	cfg, err := runtimeconfig.Load([]string{
++		"--profile-dir", t.TempDir(),
++		"--control-plane.api-key", "env:BOUNDED_TUNNEL_RUNTIME_SECRET",
++		"--control-plane.tunnel-id", "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++		"--control-plane.base-url", "https://api.openai.com",
++		"--control-plane.poll-channel", "main",
++		"--mcp.server-url", "url=http://127.0.0.1:8767/mcp,channel=main",
++	}, runtimeconfig.FlavorRuntime, func(k string) (string, bool) { v, ok := env[k]; return v, ok })
++	if err != nil {
++		t.Fatal("synthetic official config failed")
++	}
++	if cfg.ControlPlane.APIKey != expected || cfg.ControlPlane.TokenProvider != nil {
++		t.Fatal("env reference not resolved as static key")
++	}
++	token, err := cfg.ControlPlane.BearerToken(context.Background())
++	if err != nil || token != expected {
++		t.Fatal("resolved token mismatch")
++	}
++	client, err := NewTunnelServiceClient(context.Background(), &cfg.ControlPlane, nil, newDiscardLogger(), &runtimeconfig.LoggingConfig{}, metricnoop.NewMeterProvider())
++	if err != nil {
++		t.Fatal("synthetic client construction failed")
++	}
++	calls := 0
++	fake := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
++		calls++
++		if req.Header.Get("Authorization") != "Bearer "+expected {
++			t.Fatal("synthetic Authorization mismatch")
++		}
++		if req.URL.Scheme != "https" || req.URL.Host != "api.openai.com" {
++			t.Fatal("unexpected authority")
++		}
++		return &http.Response{StatusCode: 401, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"synthetic_unauthorized"}}`)), Request: req}, nil
++	})
++	client.client.Transport.(*controlPlaneRoundTripper).base = fake
++	if _, err = client.FetchTunnelMetadata(context.Background()); err == nil {
++		t.Fatal("synthetic metadata401 not rejected")
++	}
++	if _, _, err = client.Poll(context.Background(), 1); err == nil {
++		t.Fatal("synthetic poll401 not rejected")
++	}
++	if calls != 2 {
++		t.Fatal("unexpected synthetic request count")
++	}
++}
+--- a/pkg/controlplane/internal/roundtripper.go
++++ b/pkg/controlplane/internal/roundtripper.go
+@@ -2,9 +2,12 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"log/slog"
+ 	"net/http"
++	"net/url"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -72,6 +75,7 @@
+ }
+ 
+ type controlPlaneRoundTripper struct {
++	approvedOrigin      controlPlaneOrigin
+ 	base                http.RoundTripper
+ 	bearerToken         func(context.Context) (string, error)
+ 	userAgent           string
+@@ -82,14 +86,17 @@
+ 	traceContextEnabled bool
+ }
+ 
+-func newControlPlaneRoundTripper(base http.RoundTripper, bearerToken func(context.Context) (string, error), userAgent, organizationID string, mcpServerInfo func() (string, error), extraHeaders map[string]string, logger *slog.Logger, tracingEnabled ...bool) http.RoundTripper {
++func newControlPlaneRoundTripper(base http.RoundTripper, approvedURL *url.URL, bearerToken func(context.Context) (string, error), userAgent, organizationID string, mcpServerInfo func() (string, error), extraHeaders map[string]string, logger *slog.Logger, tracingEnabled ...bool) http.RoundTripper {
+ 	if base == nil {
+ 		base = tctransport.CloneDefault()
+ 	}
+ 	if logger == nil {
+ 		panic("control-plane round tripper: logger is required")
+ 	}
++	// Capture by value so later config mutation cannot change the trust boundary.
++	origin, _ := canonicalControlPlaneOrigin(approvedURL)
+ 	return &controlPlaneRoundTripper{
++		approvedOrigin:      origin,
+ 		base:                base,
+ 		bearerToken:         bearerToken,
+ 		userAgent:           userAgent,
+@@ -102,6 +109,11 @@
+ }
+ 
+ func (c *controlPlaneRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	// Check before fetching a token, changing sensitive headers or invoking any
++	// logging/transport middleware. Errors intentionally omit destinations.
++	if !c.originApproved(req) {
++		return nil, errors.New("controlplane client: request origin not approved")
++	}
+ 	token, err := c.bearerToken(req.Context())
+ 	if err != nil {
+ 		return nil, err
+@@ -170,3 +182,57 @@
+ 		return false
+ 	}
+ }
++
++// controlPlaneOrigin is immutable after construction. HTTP remains supported
++// only when explicitly configured (e.g. upstream local fixtures); an HTTPS
++// origin can never authorize an HTTP downgrade.
++type controlPlaneOrigin struct {
++	scheme string
++	host   string
++	port   string
++}
++
++func canonicalControlPlaneOrigin(u *url.URL) (controlPlaneOrigin, bool) {
++	if u == nil || u.User != nil || u.Opaque != "" || u.Host == "" {
++		return controlPlaneOrigin{}, false
++	}
++	scheme := strings.ToLower(u.Scheme)
++	if scheme != "https" && scheme != "http" {
++		return controlPlaneOrigin{}, false
++	}
++	// Parse the authority independently to reject malformed ports, embedded
++	// userinfo and authority strings containing path/query/fragment components.
++	authority, err := url.Parse(scheme + "://" + u.Host)
++	if err != nil || authority.User != nil || authority.Host != u.Host || authority.Hostname() == "" || authority.Path != "" || authority.RawQuery != "" || authority.Fragment != "" {
++		return controlPlaneOrigin{}, false
++	}
++	port := authority.Port()
++	if port == "" {
++		port = "443"
++		if scheme == "http" {
++			port = "80"
++		}
++	}
++	number, err := strconv.Atoi(port)
++	if err != nil || number < 1 || number > 65535 {
++		return controlPlaneOrigin{}, false
++	}
++	return controlPlaneOrigin{scheme, strings.ToLower(authority.Hostname()), strconv.Itoa(number)}, true
++}
++
++func (c *controlPlaneRoundTripper) originApproved(req *http.Request) bool {
++	if req == nil || c.approvedOrigin.scheme == "" {
++		return false
++	}
++	origin, ok := canonicalControlPlaneOrigin(req.URL)
++	if !ok || origin != c.approvedOrigin {
++		return false
++	}
++	if req.Host != "" {
++		hostOrigin, valid := canonicalControlPlaneOrigin(&url.URL{Scheme: req.URL.Scheme, Host: req.Host})
++		if !valid || hostOrigin != c.approvedOrigin {
++			return false
++		}
++	}
++	return true
++}
+--- a/pkg/controlplane/internal/roundtripper_test.go
++++ b/pkg/controlplane/internal/roundtripper_test.go
+@@ -6,6 +6,7 @@
+ 	"io"
+ 	"log/slog"
+ 	"net/http"
++	"net/url"
+ 	"strings"
+ 	"testing"
+ 
+@@ -36,7 +37,7 @@
+ 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+ 		seen = req.Header.Clone()
+ 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+-	}), staticBearerToken(apiKey), userAgent, "", staticMCPServerInfoHeader(serverInfo), map[string]string{"extra-header": "true"}, newDiscardLogger())
++	}), &url.URL{Scheme: "https", Host: "example.com"}, staticBearerToken(apiKey), userAgent, "", staticMCPServerInfoHeader(serverInfo), map[string]string{"extra-header": "true"}, newDiscardLogger())
+ 
+ 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+ 	if !assert.NoError(t, err, "build request") {
+@@ -70,7 +71,7 @@
+ 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+ 		seen = req.Header.Clone()
+ 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+-	}), staticBearerToken("api-key"), "ua", organizationID, nil, map[string]string{"openai-organization": "org-extra"}, newDiscardLogger())
++	}), &url.URL{Scheme: "https", Host: "example.com"}, staticBearerToken("api-key"), "ua", organizationID, nil, map[string]string{"openai-organization": "org-extra"}, newDiscardLogger())
+ 
+ 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+ 	if !assert.NoError(t, err, "build request") {
+@@ -90,7 +91,7 @@
+ 
+ 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+ 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+-	}), staticBearerToken("api-key"), "ua", "", nil, map[string]string{"X-Debug": "new"}, logger)
++	}), &url.URL{Scheme: "https", Host: "example.com"}, staticBearerToken("api-key"), "ua", "", nil, map[string]string{"X-Debug": "new"}, logger)
+ 
+ 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+ 	if !assert.NoError(t, err, "build request") {
+@@ -114,7 +115,7 @@
+ 
+ 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+ 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+-	}), staticBearerToken("api-key"), "ua", "", staticMCPServerInfoHeader(serverInfo), map[string]string{
++	}), &url.URL{Scheme: "https", Host: "example.com"}, staticBearerToken("api-key"), "ua", "", staticMCPServerInfoHeader(serverInfo), map[string]string{
+ 		"authorization":                "Bearer attacker",
+ 		"User-Agent":                   "custom-agent",
+ 		headerTunnelClientVersion:      "dev",
+@@ -149,7 +150,7 @@
+ 
+ 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+ 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+-	}), staticBearerToken("api-key"), "ua", "", nil, map[string]string{"X-Same": "same"}, logger)
++	}), &url.URL{Scheme: "https", Host: "example.com"}, staticBearerToken("api-key"), "ua", "", nil, map[string]string{"X-Same": "same"}, logger)
+ 
+ 	req, err := http.NewRequest(http.MethodGet, "https://example.com", nil)
+ 	if !assert.NoError(t, err, "build request") {
+@@ -170,7 +171,7 @@
+ 	rt := newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+ 		called = true
+ 		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+-	}), staticBearerToken("api-key"), "ua", "", func() (string, error) {
++	}), &url.URL{Scheme: "https", Host: "example.com"}, staticBearerToken("api-key"), "ua", "", func() (string, error) {
+ 		return "", errors.New("invalid declaration")
+ 	}, nil, newDiscardLogger())
+ 
+@@ -192,7 +193,7 @@
+ 		func() {
+ 			_ = newControlPlaneRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+ 				return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+-			}), staticBearerToken("api-key"), "ua", "", nil, nil, nil)
++			}), &url.URL{Scheme: "https", Host: "example.com"}, staticBearerToken("api-key"), "ua", "", nil, nil, nil)
+ 		},
+ 	)
+ }
+--- a/pkg/controlplane/internal/tunnel_service_client.go
++++ b/pkg/controlplane/internal/tunnel_service_client.go
+@@ -174,13 +174,11 @@
+ 		newManagedCloudflareBackoff:    newControlPlaneBackoff,
+ 		retrySleep:                     sleepWithContext,
+ 	}
+-	if cfg.TokenProvider != nil {
+-		// Do not attach a fresh bearer token to an HTTP redirect. Wrong-cluster
+-		// responses use the tunnel routing protocol rather than HTTP redirects.
+-		stopRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+-		client.client.CheckRedirect = stopRedirect
+-		client.secretClient.CheckRedirect = stopRedirect
+-	}
++	// All credentials, including static API keys, stay on the configured origin.
++	// Routing corrections use the tunnel protocol, never HTTP redirects.
++	stopRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
++	client.client.CheckRedirect = stopRedirect
++	client.secretClient.CheckRedirect = stopRedirect
+ 	logger.InfoContext(ctx, "TunnelServiceClient created",
+ 		slog.String("tunnel_id", client.tunnelID.String()),
+ 		slog.Int64("poll_timeout_ms", pollTimeoutMilliseconds(pollTimeout)),
+@@ -591,6 +589,7 @@
+ 
+ 	return newControlPlaneRoundTripper(
+ 		base,
++		cfg.BaseURL,
+ 		cfg.BearerToken,
+ 		version.UserAgent,
+ 		cfg.OrganizationID,
