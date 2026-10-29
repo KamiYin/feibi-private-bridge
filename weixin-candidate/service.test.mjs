@@ -178,18 +178,17 @@ const pendingQuery=s=>s.service.rpc(s.principal,message('tools/call',{name:'list
 async function queueOwner(s){s.responses.push({ret:0,msgs:[inbound()],get_updates_buf:'cursor'});await s.relay.pollOnce(s.principal);await s.service.collectEvents();return Object.values(s.store.state.deliveries)[0];}
 test('active direct query + accepted reply cancels only the undelivered notification',async()=>{
  const s=setup();await s.connect();await s.subscribe();await pendingQuery(s);const d=await queueOwner(s);
- assert.equal((await s.service.deliverDue()).attempted,0);
  const read=await pendingQuery(s);assert.equal(read.result.structuredContent.requests[0].text_complete,true);
  s.advance(17000);s.responses.push({message_id:'12345'});
  const r=await s.service.rpc(s.principal,message('tools/call',{name:'reply_to_owner',arguments:{request_id:d.event.data.request_id,text:'answer',idempotency_key:'active_reply_123'}}));assert.equal(r.result.structuredContent.status,'accepted');
  await s.service.deliverDue();assert.equal(s.store.state.deliveries[d.event.eventId].status,'inactive');s.advance(30000);assert.equal((await s.service.deliverDue()).attempted,0);assert.equal(s.posts.length,1);
 });
-test('read without reply or disconnected query response falls back at a fixed deadline',async t=>{
+test('pending queries never add a notification delay',async t=>{
  for(const mode of ['read_no_reply','lost_response','continuous_queries'])await t.test(mode,async()=>{
   const s=setup();await s.connect();await s.subscribe();await pendingQuery(s);await queueOwner(s);
   if(mode!=='lost_response')await pendingQuery(s);
-  for(let i=0;i<3;i++){s.advance(9999);if(mode==='continuous_queries')await pendingQuery(s);assert.equal((await s.service.deliverDue()).attempted,0);}
-  s.advance(3);assert.equal((await s.service.deliverDue()).attempted,1);assert.equal(s.posts.length,2);assert.equal(s.posts[1].data.data.text_complete,true);
+  if(mode==='continuous_queries')for(let i=0;i<3;i++)await pendingQuery(s);
+  assert.equal((await s.service.deliverDue()).attempted,1);assert.equal(s.posts.length,2);assert.equal(s.posts[1].data.data.text_complete,true);
  });
 });
 test('cold, stale and unauthorized queries do not delay events',async t=>{

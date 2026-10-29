@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { EVENT as RELAY_EVENT, TOOLS as RELAY_TOOLS, RelayError, inlineRequest } from './relay.mjs';
+import { EVENT as RELAY_EVENT, TOOLS as RELAY_TOOLS, MEDIA_TOOLS, RelayError, inlineRequest } from './relay.mjs';
 import { validateOfficialCallbackOrigin } from '../synthetic-pilot/hostname-proxy-callback.mjs';
 import { BridgeError, canonical, digest, equal, exactObject, fail, signature, signedRequest, signingKey, validateCallbackUrl } from '../src/security.mjs';
 
@@ -19,6 +19,7 @@ export const TOOLS = [
   { name: 'test_status', description: 'Read safe status/counts only; no text, owner IDs or credentials.', inputSchema: schema({}), annotations: {readOnlyHint:true,destructiveHint:false,openWorldHint:false}},
   ...RELAY_TOOLS,
 ];
+export const MEDIA_EVENT={...EVENT,description:EVENT.description.replace('New text request','New text, image or file request')+' Attachments contain metadata only; fetch only when needed.',payloadSchema:{...EVENT.payloadSchema,properties:{...EVENT.payloadSchema.properties,attachments:{type:'array',items:{type:'object'}},unsupported_items:{type:'array',items:{type:'object'}}}}};
 export function rpcError(id, code, message, data) { return { jsonrpc: '2.0', ...(id !== undefined ? { id } : {}), error: { code, message, ...(data ? { data } : {}) } }; }
 
 // Separate candidate wrapper around the owner relay and reviewed Events logic.
@@ -29,7 +30,7 @@ export class WeixinMcpService {
     if (!relay || !session || !store || !principal || typeof post !== 'function') throw new Error('pilot_dependencies_required');
     this.relay = relay; this.session = session; this.store = store; this.post = post; this.origins = [...allowedCallbackOrigins]; this.principal = principal;
     this.authorizeAccess = authorize; this.callbacksApproved = callbacksApproved; this.injectionApproved = injectionApproved;
-    this.now = now; this.audit = audit; this.tail = Promise.resolve(); this.stopped = false; this.lastPendingQueryAt = -Infinity;
+    this.now = now; this.audit = audit; this.tail = Promise.resolve(); this.stopped = false;
     if (originReviewApproved && (callbacksApproved || injectionApproved || allowedCallbackOrigins.length || typeof postFactory !== 'function')) throw new Error('origin_review_must_start_closed');
     this.originReviewApproved = originReviewApproved; this.postFactory = postFactory; this.pendingOrigin = null;
     if (runtimeExpiresAt !== Infinity && (!Number.isSafeInteger(runtimeExpiresAt) || runtimeExpiresAt <= now())) throw new Error('invalid_runtime_expiration');
@@ -141,7 +142,7 @@ export class WeixinMcpService {
       for(const item of events){
         const key=`evt_${item.event_id}`;if(this.store.state.deliveries[key])continue;
         const event={eventId:key,name:EVENT.name,timestamp:new Date(item.created_at).toISOString(),data:{request_id:item.request_id,source:'weixin_private',received_at:new Date(item.created_at).toISOString()},cursor:null};
-        this.store.update(s=>{s.deliveries[key]={subscriptionId:subs[0].id,relayEventId:item.event_id,event,attempts:0,nextAttemptAt:this.now()-this.lastPendingQueryAt<=15000?Math.max(this.now(),item.created_at+30000):this.now(),status:'pending'};});queued++;
+        this.store.update(s=>{s.deliveries[key]={subscriptionId:subs[0].id,relayEventId:item.event_id,event,attempts:0,nextAttemptAt:this.now(),status:'pending'};});queued++;
       }
       return {queued};
     });
@@ -164,14 +165,14 @@ export class WeixinMcpService {
         if(!this.callbacksApproved||!this.session.isAuthenticated()||sub.expiresAt<=this.now()||this.store.state.subscriptions[d.subscriptionId]!==sub)break;
         let inline;
         try { const request = await this.relay.get(this.principal,{request_id:d.event.data.request_id});
-          if(request.reply_status==='accepted'){this.store.update(s=>{s.deliveries[key].status='inactive';});continue;}
+          if(request.handled){this.store.update(s=>{s.deliveries[key].status='inactive';});continue;}
           inline = inlineRequest(request); }
         catch { this.store.update(s=>{s.deliveries[key].status='inactive';}); continue; }
-        this.store.update(s => { const item = s.deliveries[key]; item.attempts++; item.nextAttemptAt = this.now() + Math.min(60000, 1000 * 2 ** (item.attempts - 1)); });
+        this.store.update(s => { const item = s.deliveries[key]; item.attempts++; item.dispatchStartedAt=this.now(); item.nextAttemptAt = item.dispatchStartedAt + Math.min(60000, 1000 * 2 ** (item.attempts - 1)); });
         attempted++; let status = 0, failure = null;
         try { status = (await this.post(sub.url, signedRequest(sub, {...d.event,data:{...d.event.data,...inline}}, this.now()))).status; } catch (e) { failure = callbackReason(e); }
         this.callbackDiagnostic = { phase: 'delivery', status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : 0, reason: failure ?? (status >= 200 && status < 300 ? 'accepted' : 'http_rejected') };
-        this.store.update(s => { const item = s.deliveries[key]; item.status = status >= 200 && status < 300 ? 'accepted' : status >= 400 && status < 500 && ![408,429].includes(status) ? 'failed' : 'pending'; if (status === 410) delete s.subscriptions[d.subscriptionId]; });
+        this.store.update(s => { const item = s.deliveries[key]; item.httpCompletedAt=this.now();item.httpStatus=status;item.errorCode=failure; item.status = status >= 200 && status < 300 ? 'accepted' : status >= 400 && status < 500 && ![408,429].includes(status) ? 'failed' : 'pending'; if (status === 410) delete s.subscriptions[d.subscriptionId]; });
         if(this.store.state.deliveries[key].status==='accepted') await this.relay.acknowledgeEvent(this.principal,d.relayEventId);
         this.audit('event_delivery', this.store.state.deliveries[key].status);
       }
@@ -187,7 +188,7 @@ export class WeixinMcpService {
       active_subscriptions:Object.values(this.store.state.subscriptions).filter(s=>s.expiresAt>this.now()).length,
       queued_events:Object.values(this.store.state.deliveries).filter(d=>d.status==='pending').length,
       accepted_events:Object.values(this.store.state.deliveries).filter(d=>d.status==='accepted').length,
-      same_dot_verified:false};
+      same_dot_verified:false,...(this.relay.media?{attachment_input_schema:MEDIA_TOOLS.find(t=>t.name==='get_owner_attachment').inputSchema}:{})};
   }
   async rpc(caller, message) {
     const id = object(message) && (typeof message.id === 'string' || Number.isSafeInteger(message.id)) ? message.id : undefined;
@@ -203,20 +204,20 @@ export class WeixinMcpService {
       switch (message.method) {
         case 'server/discover': exactObject(p, []); result = { supportedVersions: [VERSION], capabilities: { tools: {}, events: {} } }; break;
         case 'ping': exactObject(p, []); result = {}; break;
-        case 'tools/list': case 'events/list': exactObject(p, ['cursor']); if (p.cursor != null) fail('invalid_cursor'); result = message.method === 'tools/list' ? { tools: TOOLS } : { events: [EVENT] }; break;
+        case 'tools/list': case 'events/list': exactObject(p, ['cursor']); if (p.cursor != null) fail('invalid_cursor'); result = message.method === 'tools/list' ? { tools: this.relay.media?[...TOOLS,...MEDIA_TOOLS]:TOOLS } : { events: [this.relay.media?MEDIA_EVENT:EVENT] }; break;
         case 'events/subscribe': result = await this.subscribe(caller, p); break;
         case 'events/unsubscribe': result = await this.unsubscribe(caller, p); break;
         case 'tools/call': {
           exactObject(p, ['name','arguments'], ['name']);
           if (p.name === 'test_status') { exactObject(p.arguments ?? {}, []); result = this.status(); }
-          else {result=await this.relay.tool(caller,p.name,p.arguments??{});if(p.name==='list_pending_owner_requests')this.lastPendingQueryAt=this.now();if(p.name==='relay_status')result={...result,mcp_events_integrated:true};}
-          result = { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result }; break;
+          else {result=await this.relay.tool(caller,p.name,p.arguments??{});if(p.name==='relay_status')result={...result,mcp_events_integrated:true};}
+          if(p.name!=='get_owner_attachment')result = { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result }; break;
         }
         default: fail(message.method === 'initialize' ? 'modern_only_use_2026-07-28_server_discover' : 'method_not_found', -32601);
       }
       return { jsonrpc: '2.0', id, result: { resultType: 'complete', ...result, _meta: { 'io.modelcontextprotocol/serverInfo': INFO } } };
     } catch (e) {
-      this.audit('rpc', 'rejected'); if(e instanceof RelayError)return rpcError(id,1003,'owner_relay_rejected',{reason:e.code}); const known = e instanceof BridgeError;
+      this.audit('rpc', 'rejected'); if(e instanceof RelayError)return rpcError(id,1003,'owner_relay_rejected',{reason:e.code,...(e.origin?{origin:e.origin}:{})}); const known = e instanceof BridgeError;
       return rpcError(id, known ? e.code : -32603, known ? e.message : 'internal_error', known && e.reason ? { reason: e.reason } : undefined);
     }
   }

@@ -145,6 +145,25 @@ export class IlinkSession {
     return {msgs,cursor:nextCursor};
     } catch(e) { e.httpStatus=this.#updatesHttpStatus;throw e; }
   });}
+  async getUploadUrl(fields){
+    if(!this.isAuthenticated())fail('OWNER_CONFIRMATION_REQUIRED');
+    const result=await this.#invoke({path:'/ilink/bot/getuploadurl',authenticated:true,
+      payload:{...fields,to_user_id:this.#owner,base_info:baseInfo()}});
+    this.#business(result);return result;
+  }
+  async sendItems({items,contextToken,clientId}={}){
+    if(!this.isAuthenticated())fail('OWNER_CONFIRMATION_REQUIRED');
+    if(!Array.isArray(items)||!items.length||!opaque(contextToken)||!identifier(clientId))fail('INVALID_REPLY');
+    let result;
+    // Official client sends one item per request; stop the group on uncertainty.
+    for(let i=0;i<items.length;i++){
+      if(![1,2,4].includes(items[i]?.type))fail('INVALID_REPLY');
+      result=await this.#invoke({path:'/ilink/bot/sendmessage',authenticated:true,payload:{msg:{from_user_id:'',to_user_id:this.#owner,
+        client_id:clientId+'.'+i,message_type:2,message_state:2,item_list:[items[i]],context_token:contextToken},base_info:baseInfo()}});
+      this.#business(result);
+    }
+    return {accepted:true,...(typeof result.message_id==='string'?{messageId:result.message_id}:{})};
+  }
   async sendText({text,contextToken,clientId}={}){
     if(!this.isAuthenticated())fail('OWNER_CONFIRMATION_REQUIRED');
     if(typeof text!=='string'||!text.trim()||text.includes('\0')||!opaque(contextToken)||!identifier(clientId))fail('INVALID_REPLY');

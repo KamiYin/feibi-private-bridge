@@ -5,6 +5,7 @@ import https from 'node:https';
 import tls from 'node:tls';
 import { isIP } from 'node:net';
 import { approvedIlinkOrigin, ILINK_ORIGIN, APP_CLIENT_VERSION } from './ilink.mjs';
+import { mediaUrl, CDN_ORIGIN, DEFAULT_MEDIA_BYTES } from './media.mjs';
 
 const error = code => Object.assign(new Error(code), { code });
 const reject = code => { throw error(code); };
@@ -22,7 +23,7 @@ function endpoint(path, method, legacyQrGet) {
   if (typeof path !== 'string' || path.length > 12500) reject('ILINK_ENDPOINT_REJECTED');
   if (method === 'POST') {
     if (path === '/ilink/bot/get_bot_qrcode?bot_type=3') return 'qr';
-    if (path === '/ilink/bot/getupdates' || path === '/ilink/bot/sendmessage') return 'authenticated';
+    if (path === '/ilink/bot/getupdates' || path === '/ilink/bot/sendmessage' || path === '/ilink/bot/getuploadurl') return 'authenticated';
   } else if (method === 'GET') {
     if (legacyQrGet && path === '/ilink/bot/get_bot_qrcode?bot_type=3') return 'qr_legacy';
     let url; try { url = new URL(path, ILINK_ORIGIN); } catch { reject('ILINK_ENDPOINT_REJECTED'); }
@@ -52,20 +53,32 @@ function safeHeaders(input, mode, bodyLength) {
     if (Buffer.from(decoded,'ascii').toString('base64') !== encoded || !/^(?:0|[1-9]\d{0,9})$/.test(decoded) || Number(decoded) > 4294967295) reject('ILINK_HEADERS_REJECTED');
     if (mode === 'authenticated' && (!/^Bearer [\x21-\x7e]{1,8192}$/.test(out.authorization) || out.authorization.startsWith('Bearer sk-'))) reject('ILINK_HEADERS_REJECTED');
   }
-  return { ...out, ...(['qr_status','qr_legacy'].includes(mode) ? {} : {'content-length':bodyLength}), connection:'close' };
+  return { ...out, ...(['qr_status','qr_legacy'].includes(mode) ? {} : {'content-length':bodyLength}) };
 }
 
 export function createIlinkProxyTransport({ env = {}, approvedOrigins = [ILINK_ORIGIN], networkActionApproved = false, allowLegacyQrGet = false,
+  mediaOnly = false, maxMediaBytes = DEFAULT_MEDIA_BYTES,
   proxyHttpRequest = http.request, proxyHttpsRequest = https.request, tlsConnect = tls.connect, targetRequest = https.request } = {}) {
   if (networkActionApproved !== true) reject('ILINK_NETWORK_APPROVAL_REQUIRED');
   if (!Array.isArray(approvedOrigins) || !approvedOrigins.length || approvedOrigins.length > 4) reject('INVALID_ILINK_ALLOWLIST');
   const origins = Object.freeze([...new Set(approvedOrigins.map(approvedIlinkOrigin))]);
   if (!origins.includes(ILINK_ORIGIN)) reject('FIXED_QR_ORIGIN_REQUIRED');
   const proxy = existingProxy(env);
-  return request => new Promise((resolve,rejectPromise) => {
+  const agents=new Map();
+  const transport=request => new Promise((resolve,rejectPromise) => {
     let url, mode, bytes, headers, signal, timeoutMs;
     try {
       if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(k => !['origin','path','method','headers','body','redirect','timeoutMs','signal'].includes(k))) reject('ILINK_REQUEST_REJECTED');
+      if(mediaOnly){
+        url=mediaUrl(request.origin+request.path,request.origin===CDN_ORIGIN?'cdn':'openai');
+        if(url.origin!==request.origin||!['GET','POST'].includes(request.method)||request.method==='POST'&&(url.origin!==CDN_ORIGIN||url.pathname!=='/c2c/upload')||request.method==='GET'&&url.origin===CDN_ORIGIN&&url.pathname!=='/c2c/download')reject('ILINK_REQUEST_REJECTED');
+        if(request.redirect!=='error'||!Number.isSafeInteger(request.timeoutMs)||request.timeoutMs<1||request.timeoutMs>300000)reject('ILINK_REQUEST_REJECTED');
+        if(request.method==='GET') {if(request.body!==undefined||Object.keys(request.headers??{}).length)reject('ILINK_BODY_REJECTED');headers={};}
+        else {if(!Buffer.isBuffer(request.body)||request.body.length>maxMediaBytes+16||Object.keys(request.headers??{}).length!==1||request.headers['Content-Type']!=='application/octet-stream')reject('ILINK_BODY_REJECTED');bytes=request.body;headers={'content-type':'application/octet-stream','content-length':bytes.length};}
+        signal=request.signal;timeoutMs=request.timeoutMs;mode='media';
+        if(signal!==undefined&&!(signal instanceof AbortSignal))reject('ILINK_REQUEST_REJECTED');
+        if(signal?.aborted)reject('ILINK_REQUEST_ABORTED');
+      }else{
       const origin = approvedIlinkOrigin(request.origin);
       if (!origins.includes(origin)) reject('ILINK_ORIGIN_NOT_APPROVED');
       mode = endpoint(request.path, request.method, allowLegacyQrGet === true);
@@ -79,12 +92,13 @@ export function createIlinkProxyTransport({ env = {}, approvedOrigins = [ILINK_O
       if (signal?.aborted) reject('ILINK_REQUEST_ABORTED');
       url = new URL(request.path, origin);
       if (url.origin !== origin || url.username || url.password || url.hash) reject('ILINK_REQUEST_REJECTED');
+      }
     } catch (e) { rejectPromise(e?.code ? e : error('ILINK_REQUEST_REJECTED')); return; }
     // Never retain caller-mutable header/body objects across async CONNECT/TLS.
     const method = request.method;
     const resources = new Set(); let done = false, agent, timer;
-    const cleanup = () => { for (const r of resources) { try { r.destroy(); } catch {} } try { agent?.destroy(); } catch {} };
-    const finish = (failure, result) => { if (done) return; done = true; clearTimeout(timer); signal?.removeEventListener('abort',onAbort); cleanup(); failure ? rejectPromise(failure) : resolve(result); };
+    const cleanup = () => { for (const r of resources) { try { r.destroy(); } catch {} } };
+    const finish = (failure, result) => { if (done) return; done = true; clearTimeout(timer); signal?.removeEventListener('abort',onAbort); if(failure)cleanup();resources.clear(); failure ? rejectPromise(failure) : resolve(result); };
     const fail = code => finish(error(code));
     const onAbort = () => fail('ILINK_REQUEST_ABORTED');
     const track = item => { resources.add(item); if (done) { try { item.destroy(); } catch {} } return item; };
@@ -94,7 +108,10 @@ export function createIlinkProxyTransport({ env = {}, approvedOrigins = [ILINK_O
     Promise.resolve().then(() => {
       if (done) return;
       const authority = `${url.hostname}:443`;
-      agent = new https.Agent({keepAlive:false,maxSockets:1,maxFreeSockets:0,maxCachedSessions:0});
+      agent=agents.get(url.origin);
+      if(!agent){agent=new https.Agent({keepAlive:true,maxSockets:Infinity,maxFreeSockets:4,maxCachedSessions:100});agents.set(url.origin,agent);}
+      // No Agent queue: new connections start synchronously in targetRequest below.
+      // Each connection retains this call's cancellation scope; idle sockets are reused.
       agent.createConnection = (_options, callback) => {
         if (done) { callback(error('ILINK_REQUEST_ABORTED')); return; }
         const connect = proxy.protocol === 'https:' ? proxyHttpsRequest : proxyHttpRequest;
@@ -131,11 +148,12 @@ export function createIlinkProxyTransport({ env = {}, approvedOrigins = [ILINK_O
           const status=res.statusCode ?? 0;
           if (status>=300 && status<400) return fail('ILINK_REDIRECT_BLOCKED');
           const chunks=[];let size=0;
-          res.on('data',chunk => {size+=chunk.length;if(size>1048576)fail('ILINK_RESPONSE_BOUND');else chunks.push(chunk);});
+          res.on('data',chunk => {size+=chunk.length;if(size>(mediaOnly?maxMediaBytes+16:1048576))fail(mediaOnly?'media_local_size_budget_exceeded':'ILINK_RESPONSE_BOUND');else chunks.push(chunk);});
           res.once('aborted',() => fail('ILINK_RESPONSE_FAILED'));
           res.once('error',() => fail('ILINK_RESPONSE_FAILED'));
           res.once('end',() => {
             if(done)return;if(res.complete!==true)return fail('ILINK_RESPONSE_FAILED');
+            if(mediaOnly)return finish(null,{status,body:Buffer.concat(chunks),headers:{'x-encrypted-param':res.headers?.['x-encrypted-param'],'x-error-message':res.headers?.['x-error-message']}});
             let body;try{body=new TextDecoder('utf-8',{fatal:true}).decode(Buffer.concat(chunks));}catch{return fail('ILINK_RESPONSE_ENCODING');}
             finish(null,{status,body});
           });
@@ -144,4 +162,6 @@ export function createIlinkProxyTransport({ env = {}, approvedOrigins = [ILINK_O
       } catch {fail('ILINK_REQUEST_FAILED');}
     }).catch(() => fail('ILINK_TRANSPORT_FAILED'));
   });
+  transport.close=()=>{for(const agent of agents.values())agent.destroy();agents.clear();};
+  return transport;
 }

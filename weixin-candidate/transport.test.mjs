@@ -19,10 +19,10 @@ const status=()=>({origin:ILINK_ORIGIN,path:'/ilink/bot/get_qrcode_status?qrcode
 class FakeTls extends Duplex{
   constructor(options={}){super();this.authorized=options.authorized??true;this.alpnProtocol=options.alpn??'http/1.1';this.encrypted=true;this.received=Buffer.alloc(0);this.sent=false;this.options=options;}
   _read(){}
-  _write(chunk,_enc,cb){this.received=Buffer.concat([this.received,chunk]);cb();if(this.sent||this.options.stall)return;const at=this.received.indexOf('\r\n\r\n');if(at<0)return;
-    const len=Number(/content-length:\s*(\d+)/i.exec(this.received.subarray(0,at).toString())?.[1]??0);if(this.received.length-at-4<len)return;this.sent=true;
+  _write(chunk,_enc,cb){this.received=Buffer.concat([this.received,chunk]);cb();if(this.sent&&!this.options.keepAlive||this.options.stall)return;const start=this.parsedAt??0,at=this.received.indexOf('\r\n\r\n',start);if(at<0)return;
+    const len=Number(/content-length:\s*(\d+)/i.exec(this.received.subarray(start,at).toString())?.[1]??0);if(this.received.length-at-4<len)return;this.sent=true;this.parsedAt=at+4+len;
     queueMicrotask(()=>{if(this.destroyed)return;const body=Buffer.isBuffer(this.options.responseBody)?this.options.responseBody:Buffer.from(this.options.responseBody??'{"ret":0}');
-      this.push(Buffer.concat([Buffer.from(`HTTP/1.1 ${this.options.status??200} Result\r\nContent-Length: ${body.length+(this.options.aborted?10:0)}\r\n${this.options.extraHeaders??''}Connection: close\r\n\r\n`),body]));if(this.options.aborted)this.push(null);});}
+      this.push(Buffer.concat([Buffer.from(`HTTP/1.1 ${this.options.status??200} Result\r\nContent-Length: ${body.length+(this.options.aborted?10:0)}\r\n${this.options.extraHeaders??''}Connection: ${this.options.keepAlive?'keep-alive':'close'}\r\n\r\n`),body]));if(this.options.aborted)this.push(null);});}
   setTimeout(){return this;}setNoDelay(){return this;}setKeepAlive(){return this;}ref(){return this;}unref(){return this;}
 }
 function fixture(options={}){
@@ -31,7 +31,7 @@ function fixture(options={}){
     req.end=()=>{if(options.stallProxy)return;queueMicrotask(()=>{const socket=new Duplex({read(){},write(_c,_e,cb){cb();}});calls.sockets.push(socket);req.emit('connect',{statusCode:options.proxyStatus??200},socket,options.head??Buffer.alloc(0));});};return req;};
   const tlsConnect=opts=>{calls.tls.push(opts);const socket=new FakeTls({...options,...options.responses?.shift()});calls.sockets.push(socket);if(!options.stallTls)queueMicrotask(()=>socket.emit('secureConnect'));return socket;};
   const targetRequest=(url,opts,cb)=>{calls.targets.push({url,opts});return https.request(url,opts,cb);};
-  const transport=createIlinkProxyTransport({env:options.env??{HTTPS_PROXY:'http://existing.proxy.test:8080'},approvedOrigins:options.approvedOrigins??[ILINK_ORIGIN],networkActionApproved:true,allowLegacyQrGet:options.allowLegacyQrGet===true,proxyHttpRequest:proxyRequest,proxyHttpsRequest:proxyRequest,tlsConnect,targetRequest});
+  const transport=createIlinkProxyTransport({env:options.env??{HTTPS_PROXY:'http://existing.proxy.test:8080'},approvedOrigins:options.approvedOrigins??[ILINK_ORIGIN],networkActionApproved:true,allowLegacyQrGet:options.allowLegacyQrGet===true,mediaOnly:options.mediaOnly,maxMediaBytes:options.maxMediaBytes,proxyHttpRequest:proxyRequest,proxyHttpsRequest:proxyRequest,tlsConnect,targetRequest});
   return{transport,calls};
 }
 test('construction is closed without explicit network approval and exact existing proxy selection',()=>{
@@ -45,7 +45,15 @@ test('authenticated API uses only hostname CONNECT; TLS identity/Host exact, no 
   for(const privateValue of ['synthetic-ilink-token','getupdates','get_updates_buf'])assert.ok(!JSON.stringify(opts).includes(privateValue));
   const tlsOpts=s.calls.tls[0];assert.equal(tlsOpts.servername,'ilinkai.weixin.qq.com');assert.equal(tlsOpts.rejectUnauthorized,true);assert.equal(tlsOpts.checkServerIdentity,tls.checkServerIdentity);assert.equal(tlsOpts.minVersion,'TLSv1.2');assert.deepEqual(tlsOpts.ALPNProtocols,['http/1.1']);
   const bytes=s.calls.sockets.find(x=>x.encrypted).received;assert.match(bytes.toString(),/^POST \/ilink\/bot\/getupdates HTTP\/1.1\r\n/);assert.match(bytes.toString(),/Host: ilinkai\.weixin\.qq\.com\r\n/i);assert.match(bytes.toString(),/authorization: Bearer synthetic-ilink-token/i);assert.deepEqual(bytes.subarray(bytes.indexOf('\r\n\r\n')+4),request.body);
-  assert.ok(s.calls.sockets.every(x=>x.destroyed));assert.ok(s.calls.requests.every(x=>x.destroyed));
+  assert.equal(s.calls.targets[0].opts.agent.keepAlive,true);
+});
+
+test('consecutive completed calls reuse one CONNECT and TLS socket',async()=>{
+  const s=fixture({keepAlive:true});
+  await s.transport(updates());await s.transport(updates());
+  assert.equal(s.calls.proxy.length,1);assert.equal(s.calls.tls.length,1);
+  assert.equal(s.calls.targets.length,2);
+  for(const r of s.calls.sockets)r.destroy();s.calls.targets[0].opts.agent.destroy();
 });
 test('QR POST and GET carry only required application/QR headers, never bearer',async()=>{
   for(const request of [qr(),status()]){const s=fixture();await s.transport(request);const data=s.calls.sockets.find(x=>x.encrypted).received.toString();assert.doesNotMatch(data,/authorization: Bearer/i);assert.ok(!JSON.stringify(s.calls.proxy[0]).includes('synthetic%2Fqr'));}
@@ -99,6 +107,21 @@ test('actual IlinkSession QR builder composes with candidate transport over memo
   const qrInfo=await session.startQr();assert.equal(qrInfo.qrPayload,'synthetic-display-only');assert.equal(session.status().phase,'wait');session.stop();assert.equal(s.calls.proxy.length,1);
 });
 test('no native DNS, TCP, TLS or listen call occurred in any transport test',()=>assert.equal(forbiddenCalls,0));
+test('media transport carries exact binary bytes over same proxy, no bot bearer; response headers support CDN upload',async()=>{
+  const body=Buffer.from([0,255,128,10]),s=fixture({mediaOnly:true,responseBody:body,extraHeaders:'x-encrypted-param: synthetic-upload-result\r\n'});
+  const result=await s.transport({origin:'https://novac2c.cdn.weixin.qq.com',path:'/c2c/download?encrypted_query_param=synthetic',method:'GET',headers:{},redirect:'error',timeoutMs:200});
+  assert.deepEqual(result.body,body);assert.equal(result.headers['x-encrypted-param'],'synthetic-upload-result');
+  assert.equal(s.calls.proxy[0].path,'novac2c.cdn.weixin.qq.com:443');assert.doesNotMatch(s.calls.sockets.find(x=>x.encrypted).received.toString(),/authorization|x-wechat-uin/i);
+  const upload=fixture({mediaOnly:true});await upload.transport({origin:'https://novac2c.cdn.weixin.qq.com',path:'/c2c/upload?encrypted_query_param=x',method:'POST',headers:{'Content-Type':'application/octet-stream'},body,redirect:'error',timeoutMs:200});
+  const wire=upload.calls.sockets.find(x=>x.encrypted).received;assert.deepEqual(wire.subarray(wire.indexOf('\r\n\r\n')+4),body);
+});
+test('media rejects arbitrary origins, bot credentials, redirects and local size overflow before exposing content',async()=>{
+  const args={origin:'https://novac2c.cdn.weixin.qq.com',path:'/c2c/download?encrypted_query_param=x',method:'GET',headers:{},redirect:'error',timeoutMs:200};
+  const s=fixture({mediaOnly:true});for(const patch of [{origin:'https://evil.test'},{headers:{Authorization:'Bearer no'}},{path:'/ilink/bot/getupdates'},{redirect:'follow'},{method:'POST'}])await assert.rejects(s.transport({...args,...patch}));assert.equal(s.calls.proxy.length,0);
+  await assert.rejects(fixture({mediaOnly:true,status:302}).transport(args),e=>e.code==='ILINK_REDIRECT_BLOCKED');
+  await assert.rejects(fixture({mediaOnly:true,maxMediaBytes:2,responseBody:Buffer.alloc(20)}).transport(args),e=>e.code==='media_local_size_budget_exceeded');
+  const ctrl=new AbortController();ctrl.abort();await assert.rejects(s.transport({...args,signal:ctrl.signal}));assert.equal(s.calls.proxy.length,0);
+});
 
 test('legacy QR GET remains opt-in, fixed initial origin/path, bodyless/application-only; other GET or bearer rejected',async()=>{
   const request={...qr(),method:'GET',headers:common(),body:undefined};const closed=fixture();await assert.rejects(closed.transport(request));assert.equal(closed.calls.proxy.length,0);

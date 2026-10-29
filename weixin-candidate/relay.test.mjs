@@ -118,13 +118,13 @@ test('duplicate delivery, replay after object restart and outbox acknowledgement
   assert.equal((await next.acknowledgeEvent(s.principal,event.event_id)).acknowledged,false);
   assert.equal((await next.events(s.principal)).length,0);
 });
-test('whole batch cursor and admission atomic on capacity/invalid batch failure', async () => {
+test('old pending count does not block new messages; invalid batch preserves cursor', async () => {
   const s = setup(); await ingest(s,Array.from({length:99},(_,i)=>msg(String(i+1))),'cursor-99');
   s.batches.push({msgs:[msg('100'),msg('101')],cursor:'must-not-commit'});
-  await assert.rejects(s.relay.pollOnce(s.principal),code('capacity_reached'));
-  assert.equal(s.store.snapshot().cursor,'cursor-99'); assert.equal((await s.relay.status(s.principal)).requests,99);
+  assert.equal((await s.relay.pollOnce(s.principal)).accepted,2);
+  assert.equal(s.store.snapshot().cursor,'must-not-commit'); assert.equal((await s.relay.status(s.principal)).requests,101);
   s.batches.push({msgs:[msg('100')],cursor:null}); await assert.rejects(s.relay.pollOnce(s.principal),code('invalid_batch'));
-  assert.equal(s.store.snapshot().cursor,'cursor-99');
+  assert.equal(s.store.snapshot().cursor,'must-not-commit');
 });
 test('only one poll outstanding per shared store; failed poll cannot advance cursor', async () => {
   const s = setup(); let resolve;
@@ -140,7 +140,7 @@ test('reply reserves before send; no recipient/context supplied by tool; exact d
   const s=setup(), requestId=await ingest(s); let sent;
   s.session.sendText=async args=>{
     sent=args; assert.equal(s.store.snapshot().intents[requestId].status,'sending');
-    assert.equal(s.store.snapshot().requests[requestId].contextToken,undefined);
+    assert.equal(s.store.snapshot().requests[requestId].contextToken,CONTEXT);
     return {accepted:true,messageId:'18446744073709551615'};
   };
   for (const extra of [{recipient:'someone'}, {contextToken:'forged'}]) await assert.rejects(s.relay.reply(s.principal,{...reply(requestId),...extra}),code('invalid_arguments'));
@@ -150,7 +150,7 @@ test('reply reserves before send; no recipient/context supplied by tool; exact d
   assert.deepEqual(await s.relay.reply(s.principal,reply(requestId)),{status:'accepted',duplicate:true});
   assert.equal(sent,undefined); assert.ok(firstId.startsWith('feibi:'));
   await assert.rejects(s.relay.reply(s.principal,reply(requestId,{text:'different'})),code('reply_conflict'));
-  await assert.rejects(s.relay.reply(s.principal,reply(requestId,{idempotency_key:'different_key'})),code('reply_conflict'));
+  assert.equal((await s.relay.reply(s.principal,reply(requestId,{idempotency_key:'different_key'}))).status,'accepted');
 });
 test('timeout/missing ack/errors remain unknown across restart; late response does not trigger retry', async () => {
   for (const send of [async()=>({}),async()=>{throw new Error(CONTEXT);},()=>new Promise(()=>{})]) {
@@ -274,7 +274,7 @@ test('optional state and timestamp do not reject owner text and expired bodies r
  assert.equal((await s.relay.status(s.principal)).pending,100);
  s.advance(11);s.batches.push({msgs:[msg('101',{create_time_ms:100011})],cursor:'after-expiry'});
  assert.equal((await s.relay.pollOnce(s.principal)).accepted,1);
- const status=await s.relay.status(s.principal);assert.equal(status.expired,100);assert.equal(status.pending,1);assert.equal(status.capacity,100);
+ const status=await s.relay.status(s.principal);assert.equal(status.expired,100);assert.equal(status.pending,1);assert.equal(status.capacity,null);
  assert.equal(Object.values(s.store.snapshot().requests).filter(r=>r.text!==undefined).length,1);
 });
 
@@ -335,7 +335,7 @@ test('crash after durable reservation restores unknown and never replays send',a
 });
 
 test('persistent accepted reply retains context while retaining duplicate outcome',async()=>{
- const s=setup({retentionMs:Number.MAX_SAFE_INTEGER});const id=await ingest(s);const args=reply(id);assert.equal((await s.relay.reply(s.principal,args)).status,'accepted');const state=s.store.snapshot();assert.equal(state.requests[id].text,BODY);assert.equal(state.requests[id].sentText,args.text);assert.equal(state.requests[id].status,'answered');assert.equal(state.requests[id].contextToken,undefined);assert.equal((await s.relay.reply(s.principal,args)).duplicate,true);
+ const s=setup({retentionMs:Number.MAX_SAFE_INTEGER});const id=await ingest(s);const args=reply(id);assert.equal((await s.relay.reply(s.principal,args)).status,'accepted');const state=s.store.snapshot();assert.equal(state.requests[id].text,BODY);assert.equal(state.requests[id].sentText,args.text);assert.equal(state.requests[id].status,'answered');assert.equal(state.requests[id].contextToken,CONTEXT);assert.equal((await s.relay.reply(s.principal,args)).duplicate,true);
 });
 test('production context survives reply and restart; references use item aliases and optional text type',async()=>{
  const s=setup({retentionMs:Number.MAX_SAFE_INTEGER});

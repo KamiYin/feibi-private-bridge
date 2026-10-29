@@ -7,6 +7,7 @@ import {MemoryStore} from '../src/store.mjs';
 import {makeAudit} from '../src/security.mjs';
 import {createHostnameProxyCallbackPoster,existingHttpsProxy} from '../synthetic-pilot/hostname-proxy-callback.mjs';
 import {createWeixinServer} from './http.mjs';
+import {MediaTransfer,DEFAULT_MEDIA_BYTES} from './media.mjs';
 const secret=x=>typeof x==='string'&&/^[A-Za-z0-9+/]{43}=$/.test(x)&&Buffer.from(x,'base64').toString('base64')===x;
 export function inspectWeixinRuntime(env={}){
   const issues=[],port=env.WEIXIN_PORT===undefined?8767:Number(env.WEIXIN_PORT),deadline=Number(env.WEIXIN_DEADLINE_UNIX_MS);
@@ -21,15 +22,19 @@ export function inspectWeixinRuntime(env={}){
   return{mode:'weixin_preflight_only',canStart:issues.length===0,issues,protocolVersion:VERSION,host:'127.0.0.1',port,
     memory_only:true,callbacks_enabled:false,qr_started:false,personal_channel_connected:false,secret_values_included:false};
 }
-export function createWeixinRuntime({env={},auditSink=()=>{},request,post,serverFactory=createWeixinServer}={}){
+export function createWeixinRuntime({env={},auditSink=()=>{},request,mediaRequest,post,serverFactory=createWeixinServer}={}){
   const report=inspectWeixinRuntime(env);if(!report.canStart)throw new Error('WEIXIN_PREFLIGHT_REJECTED');
   const durable=env.WEIXIN_PERSISTENT==='yes'?new PersistentState(env.WEIXIN_STATE_DIRECTORY):null;
   const deadline=Number(env.WEIXIN_DEADLINE_UNIX_MS),principal=Object.freeze({id:'single-private-weixin-owner'}),audit=makeAudit(auditSink);
-  const session=new IlinkSession({request:request??createIlinkProxyTransport({env,approvedOrigins:[ILINK_ORIGIN],networkActionApproved:true,allowLegacyQrGet:true}),
+  request??=createIlinkProxyTransport({env,approvedOrigins:[ILINK_ORIGIN],networkActionApproved:true,allowLegacyQrGet:true});
+  const session=new IlinkSession({request,
     persistent:!!durable,restored:durable?.state.session,onSave:durable?v=>durable.set('session',v):undefined,qrApproved:true,qrGet405Compatibility:true,ownerConfirmationNonce:env.WEIXIN_OWNER_NONCE,deadline,approvedApiOrigins:[ILINK_ORIGIN]});
   let stopped=false,started=false,server,timer,deadlineTimer,busy=false,tick=Promise.resolve(),eventBusy=false,eventTick=Promise.resolve(),nextPoll=0,failures=0;
   const authorize=()=>!stopped&&Date.now()<deadline;
-  const relay=new OwnerTextRelay({session,principal,authorize,readApproved:true,repliesApproved:true,eventsApproved:true,
+  const maxMediaBytes=env.WEIXIN_MEDIA_MAX_BYTES===undefined?DEFAULT_MEDIA_BYTES:Number(env.WEIXIN_MEDIA_MAX_BYTES);
+  if(env.WEIXIN_OWNER_MEDIA_APPROVED==='yes')mediaRequest??=createIlinkProxyTransport({env,networkActionApproved:true,mediaOnly:true,maxMediaBytes});
+  const media=env.WEIXIN_OWNER_MEDIA_APPROVED==='yes'?new MediaTransfer({session,maxBytes:maxMediaBytes,request:mediaRequest}):undefined;
+  const relay=new OwnerTextRelay({session,principal,authorize,readApproved:true,repliesApproved:true,eventsApproved:true,media,
     store:new RelayMemoryStore({restored:durable?.state.relay,commit:durable?v=>durable.set('relay',v):undefined}),retentionMs:durable?Number.MAX_SAFE_INTEGER:Math.max(1,Math.min(1800000,deadline-Date.now())),sendTimeoutMs:15000});
   const eventStore=new MemoryStore(durable?.state.events);if(durable)eventStore.persist=v=>durable.set('events',v);
   const service=new WeixinMcpService({session,relay,principal,authorize,store:eventStore,
@@ -38,7 +43,7 @@ export function createWeixinRuntime({env={},auditSink=()=>{},request,post,server
   if(durable?.state.callbackOrigin)service.pendingOrigin=durable.state.callbackOrigin;
   const originalApprove=service.approveCallbackOrigin.bind(service);service.approveCallbackOrigin=async origin=>{const result=await originalApprove(origin);if(durable)durable.set('callbackOrigin',origin);return result;};
   const stopRuntime=async()=>{
-    if(stopped)return;stopped=true;clearInterval(timer);clearTimeout(deadlineTimer);session.stop({preserve:true});service.stop();
+    if(stopped)return;stopped=true;clearInterval(timer);clearTimeout(deadlineTimer);session.stop({preserve:true});service.stop();media?.clear();request.close?.();mediaRequest?.close?.();
     if(server?.listening){const closed=new Promise(r=>server.close(r));const force=setTimeout(()=>server.closeAllConnections(),12000);force.unref();await closed;clearTimeout(force);}
     await Promise.allSettled([tick,eventTick]);
   };
