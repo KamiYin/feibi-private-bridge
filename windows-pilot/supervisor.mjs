@@ -37,13 +37,14 @@ export function validateBootstrap(x,{platform=process.platform}={}){
   const fields=['action','runtime_key','expected_suffix','tunnel_id','nonce','seconds','directory','routing_snapshot','acl_verified','tunnel_approved','qr_approved','text_transfer_approved','reply_approved'];
   if(obj(x)&&x.persistent===true)fields.push('persistent','state_directory');
   if(obj(x)&&Object.hasOwn(x,'deadline_utc'))fields.push('deadline_utc');
+  if(obj(x)&&x.media_approved===true)fields.push('media_approved');
   if(!exact(x,fields)||x.action!=='bootstrap'||!KEY.test(x.runtime_key??'')||!TUNNEL.test(x.tunnel_id??'')||!NONCE.test(x.nonce??'')||!Number.isInteger(x.seconds)||x.seconds<1||(x.persistent!==true&&x.seconds>43200))fail('BOOTSTRAP_REJECTED');
   if(Object.hasOwn(x,'deadline_utc')&&(typeof x.deadline_utc!=='string'||!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(x.deadline_utc)||!Number.isFinite(Date.parse(x.deadline_utc))||new Date(Date.parse(x.deadline_utc)).toISOString()!==x.deadline_utc))fail('BOOTSTRAP_REJECTED');
   if(x.expected_suffix!==''&&(!/^[A-Za-z0-9_-]{4}$/.test(x.expected_suffix)||!x.runtime_key.endsWith(x.expected_suffix)))fail('KEY_PASTE_CHECK_FAILED');
   for(const k of ['acl_verified','tunnel_approved','qr_approved','text_transfer_approved','reply_approved'])if(x[k]!==true)fail('ACTION_APPROVAL_REQUIRED');
   if(typeof x.directory!=='string'||!path.isAbsolute(x.directory)||!/^feibi-private-[0-9a-f]{32}$/.test(path.basename(x.directory)))fail('PRIVATE_DIRECTORY_REQUIRED');
   if(x.persistent===true&&(!path.isAbsolute(x.state_directory??'')||!x.deadline_utc))fail('PERSISTENT_CONFIGURATION_REQUIRED');
-  return{...x,routing:validateWindowsRouting({snapshot:x.routing_snapshot,existingRouteApproved:true,platform})};
+  return{...x,routing:validateWindowsRouting({snapshot:x.routing_snapshot,existingRouteApproved:true,platform,mediaApproved:x.media_approved===true})};
 }
 export function parseControl(line){
   if(typeof line!=='string'||Buffer.byteLength(line)>1024)fail('INVALID_OPERATOR_CONTROL');
@@ -62,16 +63,17 @@ export function childEnvironments(config,keys,deadline,source={}){
   const node={...common,SYNTHETIC_MCP_SECRET:keys.mcp,SYNTHETIC_OPERATOR_SECRET:keys.operator,HTTPS_PROXY:config.routing.proxyUrl,
     WEIXIN_PRIVATE_PILOT_APPROVED:'yes',WEIXIN_QR_APPROVED:'yes',WEIXIN_OWNER_TEXT_TRANSFER_APPROVED:'yes',WEIXIN_OWNER_TEXT_REPLY_APPROVED:'yes',WEIXIN_TUNNEL_ISOLATION:'single-user',WEIXIN_PORT:'8767',WEIXIN_DEADLINE_UNIX_MS:String(deadline),WEIXIN_OWNER_NONCE:config.nonce};
   if(config.persistent){node.WEIXIN_PERSISTENT='yes';node.WEIXIN_STATE_DIRECTORY=config.state_directory;}
+  if(config.media_approved)node.WEIXIN_OWNER_MEDIA_APPROVED='yes';
   const runtime={...common,BOUNDED_TUNNEL_RUNTIME_SECRET:config.runtime_key,SYNTHETIC_MCP_SECRET:keys.mcp};
   runtime.BOUNDED_EXISTING_HTTPS_PROXY=config.routing.proxyUrl;
   return{node,runtime,renderer:common};
 }
 export function runtimeArgs(config){
   const a=['run','--control-plane.api-key','env:BOUNDED_TUNNEL_RUNTIME_SECRET','--control-plane.tunnel-id',config.tunnel_id,
-    '--control-plane.base-url','https://api.openai.com','--control-plane.poll-channel','main','--control-plane.max-inflight','1','--control-plane.poll-timeout','10s',
+    '--control-plane.base-url','https://api.openai.com','--control-plane.poll-channel','main','--control-plane.max-inflight',config.media_approved?'4':'1','--control-plane.poll-timeout','10s',
     '--control-plane.initial-poll-timeout','5s','--control-plane.poll-deadline-guardrail','30s','--mcp.server-url','url=http://127.0.0.1:8767/mcp,channel=main',
     '--mcp.extra-headers','X-Synthetic-Mcp-Auth: env:SYNTHETIC_MCP_SECRET','--mcp.discovery-extra-headers','X-Synthetic-Mcp-Auth: env:SYNTHETIC_MCP_SECRET',
-    '--mcp.max-concurrent-requests','1','--profile-dir',path.join(config.directory,'empty-profiles'),'--health.listen-addr','127.0.0.1:8768',
+    '--mcp.max-concurrent-requests',config.media_approved?'4':'1','--profile-dir',path.join(config.directory,'empty-profiles'),'--health.listen-addr','127.0.0.1:8768',
     '--health.show-details=false','--log.level','warn','--log.format','json','--log.http-raw-unsafe=false','--tracing.enabled=false','--forward-request-id','none',
     '--harpoon.hosts-include-loopback=false','--harpoon.hosts-include-private=false'];
   a.push('--control-plane.http-proxy','env:BOUNDED_EXISTING_HTTPS_PROXY');
@@ -205,9 +207,9 @@ export class Supervisor{
 export function decodeBootstrapLine(line){if(typeof line!=='string'||Buffer.byteLength(line)>16384)fail('BOOTSTRAP_REJECTED');let x;try{x=JSON.parse(line.startsWith('\ufeff')?line.slice(1):line);}catch{fail('BOOTSTRAP_REJECTED');}if(!obj(x))fail('BOOTSTRAP_REJECTED');return x;}
 export async function main(argv=process.argv.slice(2)){
   if(argv.length===0||argv.length===1&&argv[0]==='--preflight'){process.stdout.write(JSON.stringify(preflight())+'\n');return;}
-  if(argv.length===1&&argv[0]==='--routing-check'){
+  if(argv[0]==='--routing-check'&&(argv.length===1||argv.length===2&&argv[1]==='--media')){
     let size=0;const chunks=[];for await(const b of process.stdin){size+=b.length;if(size>16384)fail('ROUTING_INPUT_BOUND');chunks.push(b);}
-    try{const r=validateWindowsRouting({snapshot:decodeBootstrapLine(Buffer.concat(chunks).toString('utf8')),existingRouteApproved:true});process.stdout.write(JSON.stringify({event:'routing_validated',...r.summary})+'\n');}
+    try{const r=validateWindowsRouting({snapshot:decodeBootstrapLine(Buffer.concat(chunks).toString('utf8')),existingRouteApproved:true,mediaApproved:argv.includes('--media')});process.stdout.write(JSON.stringify({event:'routing_validated',...r.summary})+'\n');}
     catch(e){const code=typeof e?.code==='string'&&/^WINDOWS_[A-Z_]{1,64}$/.test(e.code)?e.code:'ROUTING_REJECTED';process.stdout.write(JSON.stringify({event:'routing_rejected',reason:code})+'\n');process.exitCode=1;}return;
   }
   if(argv.length!==1||argv[0]!=='--managed')fail('EXPLICIT_WINDOWS_LAUNCHER_REQUIRED');

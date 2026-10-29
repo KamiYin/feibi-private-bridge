@@ -685,3 +685,11 @@ test('safe health exposes fixed poll transport diagnostics without request data'
  assert.ok(!JSON.stringify(got).includes('PRIVATE'));
  assert.deepEqual(safeHealth({details:{transport_phase:'PRIVATE',transport_protocol:'PRIVATE',transport_reused:'PRIVATE',connection_pool_resets:-1,transport_elapsed_ms:NaN}}).details,{});
 });
+
+test('media opt-in preserves text defaults and enables four tunnel workers with explicit same-route media hosts',()=>{
+  const x=input();x.media_approved=true;x.routing_snapshot.routes.push(...['https://novac2c.cdn.weixin.qq.com','https://files.oaiusercontent.com','https://files.openai.com','https://sdmntprseasia.oaiusercontent.com'].map(origin=>({origin,proxyUrl:'http://proxy.invalid:8080'})));
+  const media=validateBootstrap(x,{platform:'win32'}),args=runtimeArgs(media);
+  assert.equal(childEnvironments(media,{mcp:'m',operator:'o'},123).node.WEIXIN_OWNER_MEDIA_APPROVED,'yes');
+  for(const key of ['--control-plane.max-inflight','--mcp.max-concurrent-requests']){assert.equal(args[args.indexOf(key)+1],'4');const original=runtimeArgs(config());assert.equal(original[original.indexOf(key)+1],'1');}
+  delete x.media_approved;assert.throws(()=>validateBootstrap(x,{platform:'win32'}));
+});

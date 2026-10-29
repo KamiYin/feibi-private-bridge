@@ -16,6 +16,7 @@ param(
   [switch]$ApproveQrLogin,
   [switch]$ApproveOwnerTextTransfer,
   [switch]$ApproveOwnerReply,
+  [switch]$ApproveOwnerMedia,
   [string]$TunnelId = '',
   [string]$OwnerNonce = '',
   [string]$ExpectedSuffix = '',
@@ -124,7 +125,7 @@ function Start-StandaloneHost {
   # only launches it; no input/output redirection or persistent service is used.
   $hostPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $argsText = '-NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File ' + (Quote-Argument $PSCommandPath) + ' -Run -StandaloneChild'
-  foreach ($name in @('Persistent','NativeClipboard','StoredCredential','ApprovePrivateTunnel','ApproveQrLogin','ApproveOwnerTextTransfer','ApproveOwnerReply')) {
+  foreach ($name in @('Persistent','NativeClipboard','StoredCredential','ApprovePrivateTunnel','ApproveQrLogin','ApproveOwnerTextTransfer','ApproveOwnerReply','ApproveOwnerMedia')) {
     if (Get-Variable -Name $name -ValueOnly) { $argsText += ' -' + $name }
   }
   $argsText += ' -TunnelId ' + (Quote-Argument $TunnelId) + ' -OwnerNonce ' + (Quote-Argument $OwnerNonce) + ' -Seconds ' + $Seconds
@@ -200,6 +201,7 @@ function New-NodeProcess([string]$Mode) {
 function Get-ExistingRouting {
   # This may evaluate the user's existing PAC, so called only after explicit Run.
   $origins = @('https://api.openai.com','https://ilinkai.weixin.qq.com','https://connectors.api.openai.com')
+  if ($ApproveOwnerMedia) { $origins += @('https://novac2c.cdn.weixin.qq.com','https://files.oaiusercontent.com','https://files.openai.com','https://sdmntprseasia.oaiusercontent.com') }
   $items = @()
   if (-not [string]::IsNullOrWhiteSpace($env:HTTPS_PROXY)) {
     $source = 'explicit-process-https-proxy'
@@ -538,7 +540,9 @@ public static class FeibiPipeWrite {
 '@
   $script:startupStage = 'routing'
   $routing = Get-ExistingRouting
-  $routingCheck = New-NodeProcess '--routing-check'
+  $routingArguments = '--routing-check'
+  if ($ApproveOwnerMedia) { $routingArguments += ' --media' }
+  $routingCheck = New-NodeProcess $routingArguments
   try {
     Write-PrivateLine $routingCheck ($routing | ConvertTo-Json -Depth 6 -Compress); $routingCheck.StandardInput.Close()
     $routingResult = $routingCheck.StandardOutput.ReadToEnd() | ConvertFrom-Json
@@ -678,6 +682,7 @@ public sealed class FeibiControlInput : IDisposable {
     }
     if ($script:runtimeKey -cnotmatch '\Ask-[A-Za-z0-9_-]{20,1021}\z' -or ($ExpectedSuffix -ne '' -and -not $script:runtimeKey.EndsWith($ExpectedSuffix,[StringComparison]::Ordinal))) { throw 'KEY_PASTE_CHECK_FAILED' }
     $bootstrap = @{action='bootstrap';runtime_key=$script:runtimeKey;expected_suffix=$ExpectedSuffix;tunnel_id=$TunnelId;nonce=$OwnerNonce;seconds=$Seconds;directory=$script:directory;routing_snapshot=$routing;acl_verified=$true;tunnel_approved=$true;qr_approved=$true;text_transfer_approved=$true;reply_approved=$true}
+    if ($ApproveOwnerMedia) { $bootstrap.media_approved = $true }
     if ($Persistent) {
       Initialize-FeibiCredentialDirectory
       $stateDir = [IO.Path]::GetDirectoryName((Get-FeibiCredentialPath))

@@ -15,6 +15,7 @@ try {
  while(-not [IO.File]::Exists($marker)){
   $hostPath=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $argsText='-NoLogo -NoProfile -STA -ExecutionPolicy RemoteSigned -File "'+(Join-Path $root 'start.ps1')+'" -Run -StandaloneChild -Persistent -StoredCredential -ApprovePrivateTunnel -ApproveQrLogin -ApproveOwnerTextTransfer -ApproveOwnerReply -TunnelId '+$configuration.tunnel_id+' -OwnerNonce '+$configuration.owner_nonce
+  if($configuration.media_enabled -eq $true){$argsText += ' -ApproveOwnerMedia'}
   $info=New-Object Diagnostics.ProcessStartInfo
   $info.FileName=$hostPath;$info.Arguments=$argsText;$info.WorkingDirectory=$root
   $info.UseShellExecute=$false;$info.CreateNoWindow=$true

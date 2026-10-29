@@ -1,4 +1,5 @@
 {
   "tunnel_id": "YOUR_TUNNEL_ID",
-  "owner_nonce": "YOUR_OWNER_NONCE"
+  "owner_nonce": "YOUR_OWNER_NONCE",
+  "media_enabled": true
 }

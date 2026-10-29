@@ -10,6 +10,7 @@ export const WINDOWS_FIXED_ORIGINS = Object.freeze([
   'https://api.openai.com',
   'https://connectors.api.openai.com',
 ]);
+export const WINDOWS_MEDIA_ORIGINS=Object.freeze(['https://novac2c.cdn.weixin.qq.com','https://files.oaiusercontent.com','https://files.openai.com','https://sdmntprseasia.oaiusercontent.com']);
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const exact = (value, keys) => value !== null && typeof value === 'object' && !Array.isArray(value) &&
@@ -51,15 +52,16 @@ export function snapshotFromExplicitProxyEnv(env) {
  * arbitrary JSON came from Windows. platform is injectable for offline tests;
  * production callers must omit it, retaining the actual process.platform gate.
  */
-export function validateWindowsRouting({ snapshot, existingRouteApproved = false, platform = process.platform } = {}) {
+export function validateWindowsRouting({ snapshot, existingRouteApproved = false, platform = process.platform, mediaApproved = false } = {}) {
+  const origins=mediaApproved?[...WINDOWS_FIXED_ORIGINS,...WINDOWS_MEDIA_ORIGINS]:WINDOWS_FIXED_ORIGINS;
   if (platform !== 'win32') fail('WINDOWS_RUNTIME_REQUIRED');
   if (existingRouteApproved !== true) fail('WINDOWS_EXISTING_ROUTE_APPROVAL_REQUIRED');
   if (!exact(snapshot, ['version', 'source', 'routes']) || snapshot.version !== 1 ||
       !['windows-default-web-proxy', 'explicit-process-https-proxy'].includes(snapshot.source) ||
-      !Array.isArray(snapshot.routes) || snapshot.routes.length !== WINDOWS_FIXED_ORIGINS.length) fail('WINDOWS_ROUTE_SNAPSHOT_INVALID');
+      !Array.isArray(snapshot.routes) || snapshot.routes.length !== origins.length) fail('WINDOWS_ROUTE_SNAPSHOT_INVALID');
   const routes = new Map();
   for (const route of snapshot.routes) {
-    if (!exact(route, ['origin', 'proxyUrl']) || !WINDOWS_FIXED_ORIGINS.includes(route.origin) || routes.has(route.origin)) fail('WINDOWS_ROUTE_SNAPSHOT_INVALID');
+    if (!exact(route, ['origin', 'proxyUrl']) || !origins.includes(route.origin) || routes.has(route.origin)) fail('WINDOWS_ROUTE_SNAPSHOT_INVALID');
     routes.set(route.origin, canonicalProxy(route.proxyUrl, route.origin));
   }
   if (new Set(routes.values()).size !== 1) fail('WINDOWS_DIFFERING_ROUTES_UNSUPPORTED');
@@ -67,6 +69,6 @@ export function validateWindowsRouting({ snapshot, existingRouteApproved = false
   // Caller builds a fresh child env; do not merge inherited proxy/no_proxy values.
   // In particular, this is NOT a global Windows proxy/VPN setting change.
   return Object.freeze({ proxyUrl, env: Object.freeze({ HTTPS_PROXY: proxyUrl }),
-    summary: Object.freeze({ mode: 'existing-proxy', origins: WINDOWS_FIXED_ORIGINS.length }),
+    summary: Object.freeze({ mode: 'existing-proxy', origins: origins.length }),
   });
 }
