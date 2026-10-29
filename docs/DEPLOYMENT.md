@@ -1,3 +1,13 @@
+# 0.3 媒体版部署补充
+
+复制 windows-pilot/deployment.example.json 为同目录 deployment.local.json，填入自己的 tunnel_id 与 owner_nonce。media_enabled:true 使后台入口传入 -ApproveOwnerMedia，并将 MCP/tunnel 并发设为 4；false 保留文字模式。该本地配置被 gitignore 排除。
+
+交互式首次启动的原命令加入 -ApproveOwnerMedia 即可。媒体使用既有代理通往微信 CDN 与 OpenAI 文件托管；没有新增存储服务、模型或凭据。需要宿主支持 openai/fileParams；部署后刷新原插件，检查 10 项工具（媒体模式），更新自动化的每发送 key、final:false 与 handled 语义。
+
+未知发送不得自动换 key 重试。迁移保留原状态、绑定和订阅；不要初始化新订阅。首次部署到自己的环境需要自己的授权和绑定，不使用原作者的配置。
+
+以下为沿用的构建、凭据和后台任务步骤：
+
 # 安装、运行与恢复
 
 ## 环境与源码检查

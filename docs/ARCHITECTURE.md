@@ -1,36 +1,31 @@
-# 当前架构与消息流程
+# 当前架构与工具
 
-微信 iLink → 本机收取与本人校验 → pending / 签名 Events → 原 dot 会话 → reply 工具 → 原微信私聊。没有额外模型调用或第三方接收方。
+微信 getupdates → 本人来源检查 → 原子保存请求／游标 → 原 Events 订阅通知 → dot → MCP 回复 → 微信 sendmessage。
 
-## 组件
+文字与附件元数据直接进入事件；文件读取与准备不持有文字轮询锁。未知 item 保留 type/content_available:false，其余可支持 item 按原顺序传递。桥接不会把未知类型当作已成功解析的图片。
 
-| 文件 | 职责 |
+## 发送与完成
+
+| 工具 | 输入与语义 |
 | --- | --- |
-| windows-pilot/start.ps1 | 输入与权限、现有代理、私有目录、Job 生命周期、可见扫码、文件控制 |
-| launch-hidden.vbs / continuous.ps1 / install-logon.ps1 | 无控制台任务入口、单实例监督、当前用户登录启动和显式停止 |
-| supervisor.mjs | 子进程隔离环境、健康状态、扫码与本地控制、试验截止及正式模式 |
-| persistent-state.mjs / state-dpapi.ps1 | DPAPI 封装数据密钥、AES-GCM 状态、fsync + rename 原子提交 |
-| ilink.mjs | 登录、收取、无损 JSON ID、纯文字发送和顺序分段 |
-| relay.mjs | 当前本人绑定、请求及发送意图、引用缓存、去重、正文直达 |
-| service.mjs / runtime.mjs | 原订阅恢复、事件协调、收取与回调独立调度 |
-| poll-connection-recovery.patch | Go 实际连接池更新及可脱敏阶段诊断 |
+| reply_to_owner | request_id、text、idempotency_key |
+| reply_with_files_to_owner | 上述字段及 files；宿主按 openai/fileParams 注入下载对象 |
+| reply_with_owner_attachments | 上述字段及 attachments，每项为 request_id、attachment_id |
+| send_to_owner | text、idempotency_key；最近真实本人 contextToken，无 request_id 或收件人 |
+| mark_owner_requests_handled | request_ids 数组；不发送，不伪造 accepted |
+| get_owner_request | request_id；含 handled、reply_status、附件／引用元数据 |
+| list_pending_owner_requests | 无参数；排除 handled 与最近发送结果不确定的请求 |
+| get_owner_attachment | request_id、attachment_id；可选 offset、length（字节） |
+| relay_status / test_status | 安全状态和计数 |
 
-## 正常消息
+三个 reply 工具支持可选 final、handled_request_ids。final:false 为进度；省略或 true 在 accepted 后完成当前请求。handled_request_ids 用于同次 accepted 回复覆盖的其他请求。每条不同消息用独立稳定 key；同次发送重试保持原 key 与参数。unknown 不能换 key 再发。只需结束处理而无需发送时使用 handled 工具。
 
-通过身份校验的本人文字生成真实 request_id。短文字与引用在合计 4000 UTF-8 字节预算内直接放入 pending 或事件；text_complete=false 时按原 UUID get。读取不消费请求。回复沿来信 context_token，工具不允许覆盖收件人或上下文。
+旧 intents 迁入 sends；保留 latest intent 供原工具读取。原 sending 在重启时成为 unknown。已经删除的旧 contextToken 不伪造恢复。新回复保留请求上下文，因此完成后仍能跟进。主动发送复用最新真实上下文，不保证微信接受任意久远 token。
 
-发送前持久提交 sending 意图；提交失败则不发送。崩溃恢复的 sending 变成 unknown，重复工具调用不重发。accepted 后取消尚未投递通知；平台已接受的通知不可撤销，使用稳定请求 ID 和幂等键处理晚到事件。
+## 附件与存储
 
-最近 15 秒有成功鉴权 pending 查询时，新消息通知至多延迟到接收后 30 秒。持续查询不会延长这条消息的截止。没有近期查询时立即通知；读取后未回复、读取响应丢失或会话中断均在有界等待后回到事件通路。
+图片直接返回 image content；文件返回嵌入 resource/blob。大响应失败时用分段读取，客户端直接解码写文件。next_offset/eof 指示进度，不把大段 base64 放进模型正文。
 
-## 恢复与存储
+原件下载缓存共用本地字节预算；默认 256 MiB 是实现的内存预算，不是微信官方上限。上传复用协议 MD5、AES 与已上传引用，不增加额外文件校验。宿主 file_id 复用下载结果；附件准备最多两份并行，最终数组保持原顺序。
 
-当前用户 DPAPI 只在启动时解封一个随机数据密钥；状态提交使用 AES-256-GCM，先写 .next、fsync，再原子改名。保存登录与绑定、relay 状态、游标、原订阅和已批准 callback origin。不要把密文视为可公开资料：同一用户权限的程序可能解密。
-
-runtime-state.enc 是恢复状态，不是完整聊天档案。完成请求的引用缓存最多 100 条 / 4 MiB；淘汰正文不删除幂等结果，也不使旧消息重新发送。出站只有实际拿到服务端 message_id 才建立 ID→正文映射。没有 ID 时不能由 context_token 或 client_id 猜造。全文存档方案暂停。
-
-正式运行不设试验截止；认证失效需要按上游要求重新登录。监督器的 5 秒崩溃恢复不覆盖密钥过期或被撤销的授权。主动 stop 先持久写停止标记，后续登录任务不会自行恢复，需明确 Resume。
-
-## 引用
-
-引用依次读取 ref_msg.svr_id 或 ref_msg.message_item.msg_id；原始数字 JSON ID 用 source-aware reviver 保存字面字符串。可选 type 不应丢掉已有 text_item；partial_text 对象识别为局部引用元数据。引用始终是上下文，不是新授权。缺少原文和匹配 ID 时明确 not_cached；只保留安全结构诊断，不猜原文、不读微信历史或附件。
+加密快照仍同步保存，发送前持久记录保障崩溃后的幂等。窄读请求、减少 clone、无变化空轮询不保存；没有新数据库或监控服务。已完成引用内容缓存最多 100 条／4 MiB，未扩展为全文聊天档案。
