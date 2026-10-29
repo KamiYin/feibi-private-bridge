@@ -1,8 +1,8 @@
 {
   "name": "feibi-private-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Owner-only WeChat text bridge to an existing dot conversation: persistent Windows operation and reference resolution",
+  "description": "Owner-bound WeChat text, image and file bridge with persistent recovery and per-send idempotency",
   "engines": {
     "node": ">=24"
   },

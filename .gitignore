@@ -33,3 +33,9 @@ windows-pilot/host-file-check.txt
 windows-pilot/profile-inspection.json
 operator-stopped
 rollback-*/
+
+# Private attachments, release work products and local evidence
+evidence/
+attachments/
+*-results.txt
+DEPLOYED_REVISION

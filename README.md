@@ -1,44 +1,38 @@
-# 菲比 · 本人微信文字桥接
+# 菲比私人微信桥接
 
-将本人微信私聊接入已有菲比 / dot 会话，由原会话处理和回复。桥接负责收取、通知、工具调用与发送，不另接模型服务。
+0.3.0 源码：将已绑定本人的微信私聊接入已有 dot 会话，支持文字、普通图片与文件双向传递。桥接不调用额外模型，附件按需读取，不强制识别或摘要。
 
-**0.2.0：长期文字版里程碑（2026-10-28）**。已在实际部署中完成持续后台模式、加密恢复、原订阅与待处理消息恢复、正文直达，以及出站引用的真实匹配。公开仓库交付源码、测试、补丁和技术记录，不包含部署凭据、聊天记录或运行时 EXE。
+- 同一请求可多次回复；每次发送独立幂等，unknown 不自动重发。
+- 可向当前绑定本人主动发送文字；使用最近真实来信提供的 contextToken，不开放收件人参数。微信是否接受过期上下文由服务端决定。
+- 显式批量标记 handled，处理完成与发送结果分开；支持旧加密状态迁移。
+- 混合消息保留支持的内容，不支持项给出类型元数据；普通 GIF 文件可以传，微信动态展示未通过验收。
+- 图片返回 MCP image；文件返回 resource/blob。大文件可用 offset/length 分段，同一原件只下载一次。
+- 媒体模式 MCP 并发 4；附件准备最多两份并行且保留顺序；连接、下载与上传结果复用。
+- Windows 当前用户计划任务后台运行，DPAPI 保护密钥，原状态恢复登录与订阅。
 
-## 当前实现
+## 使用
 
-- 当前 Windows 用户 DPAPI 保护密钥，AES-256-GCM 原子保存登录、游标、待处理请求、发送结果与原订阅；重启可免扫码恢复。
-- 当前用户登录任务通过无控制台入口后台运行；子进程崩溃后重启，主动 stop 写入停止标记，不自行拉起。
-- 长期模式没有试验硬截止；试验模式仍支持固定截止。真正的网络超时、身份绑定和未知发送不重试保持不变。
-- Events / pending 可携带完整短文本，避免每次再 get；超出总预算时明确回退读取，不静默截断。
-- 主动读取近期活跃时，尚未投递通知最多等待至消息接收后 30 秒；只有成功回复才取消，读取丢失或中断仍有事件兜底。
-- 引用正文与新指令分开；服务端 ID 无损字符串解析；支持外层 svr_id 和内层 message_item.msg_id。真实出站引用已验收成功。
-- Go tunnel-client 补丁在首次自身 poll deadline 后更换底层连接池，保留代理、TLS、父取消和发送语义。
+需要自己的官方 Tunnel、授权账号、微信绑定和 dot 插件／Events 订阅。源码不包含原部署的身份、密钥、绑定、订阅或文件；复制代码不会自动接入原作者的会话。
 
-引用缓存只保留最近 100 条完成请求、合计 4 MiB；待处理状态另存。全文存档扩展已暂停，当前没有完整聊天档案或全历史检索功能。没有图片、文件、群聊或任意收件人能力。
-
-## 检查与部署
-
-Windows x64 / PowerShell 5.1 STA / Node.js 24+，JavaScript 无需 npm install：
+Windows x64、PowerShell 5.1 STA、Node.js 24+。无需 npm install。源码不带运行 EXE；构建与部署见 [DEPLOYMENT](docs/DEPLOYMENT.md)。
 
 ~~~powershell
 npm test
 npm run preflight
 ~~~
 
-公开包没有 EXE，预检应报告 REVIEWED_BINARY_MISSING，同时 launched=false、credential_read=false。先阅读[部署与恢复](docs/DEPLOYMENT.md)，再配置自己的平台隧道和本人授权。
+未配置二进制时预检报告 REVIEWED_BINARY_MISSING，且不会启动或读取凭据。
 
-## 技术记录
+## 文档
 
-| 文档 | 内容 |
-| --- | --- |
-| [架构](docs/ARCHITECTURE.md) | 当前流程、持久化和生命周期 |
-| [完整阶段记录](docs/MILESTONE_02.md) | 从阶段一到长期版的变更、失败尝试、纠正和取舍 |
-| [性能证据](docs/PERFORMANCE.md) | 分阶段实测与不可归因部分 |
-| [时间线](docs/TIMELINE.md) | 保留历史事实，追加本阶段 |
-| [排障](docs/TROUBLESHOOTING.md) | 已修复问题与真实边界 |
-| [验证](docs/VALIDATION.md) | 本次公开测试与原部署验收分别记录 |
-| [发布范围](docs/PUBLICATION.md) | 脱敏、源码差异、许可与发布约束 |
-| [变更日志](CHANGELOG.md) | 版本摘要 |
-| [第三方归属](THIRD_PARTY_NOTICES.md) | 上游来源和保留许可 |
+- [工具语义与架构](docs/ARCHITECTURE.md)
+- [部署与恢复](docs/DEPLOYMENT.md)
+- [性能改动与证据](docs/PERFORMANCE.md)
+- [验证记录](docs/VALIDATION.md)
+- [故障处理](docs/TROUBLESHOOTING.md)
+- [发布差异与排除项](docs/PUBLICATION.md)
+- [第三方来源](THIRD_PARTY_NOTICES.md)
+- [历史 0.2 里程碑](docs/MILESTONE_02.md)
+- [历史 0.2 详细验证、性能与排障证据](docs/MILESTONE_02_EVIDENCE.md)
 
-不承诺秒回或平台永久唤醒。完整 Windows 重新登录与 dot 应用重启后的端到端恢复尚未单独验收。项目整体仍未另授通用开源许可证；原有第三方许可保持其原适用范围。
+未引入永久固定微信身份；沿用当前绑定本人入站与出站检查。本文档不把私有原型验收等同于任意宿主都支持 fileParams。宿主需实际提供文件参数注入与二进制工具结果处理。项目尚未选择自有代码的通用开源许可证，第三方许可证保持原范围。
